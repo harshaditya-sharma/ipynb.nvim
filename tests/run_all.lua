@@ -396,6 +396,7 @@ local tests = {
   join(root, 'tests/test_kernel_messages.lua'),
   join(root, 'tests/test_kernel_e2e.lua'),
   join(root, 'tests/test_split_editor.lua'),
+  join(root, 'tests/test_features.lua'),
   join(root, 'tests/test_shadow.lua'),
   join(root, 'tests/test_lsp.lua'),
   join(root, 'tests/test_lsp_go.lua'),

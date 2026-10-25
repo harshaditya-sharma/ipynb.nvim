@@ -307,11 +307,13 @@ function M.setup_highlights(hl_config)
   set_hl(0, 'IpynbExecCount', { link = hl_config.exec_count, default = true })
   set_hl(0, 'IpynbOutput', { link = hl_config.output, default = true })
   set_hl(0, 'IpynbOutputError', { link = hl_config.output_error, default = true })
+  set_hl(0, 'IpynbOutputStderr', { link = hl_config.output_stderr or 'DiagnosticWarn', default = true })
   set_hl(0, 'IpynbExecuting', { link = hl_config.executing, default = true })
   set_hl(0, 'IpynbQueued', { link = hl_config.queued, default = true })
 
   -- Action hints
   set_hl(0, 'IpynbHint', { link = hl_config.hint, default = true })
+  set_hl(0, 'IpynbCellTitle', { link = hl_config.cell_title or 'Title', default = true })
 end
 
 ---Get the visible text width for the current window
@@ -325,6 +327,26 @@ local function get_text_width(win)
     width = width - wininfo.textoff
   end
   return width
+end
+
+---Title and tags for the border: "Load data · #setup #parameters"
+---@param cell Cell
+---@return string
+function M.cell_annotation(cell)
+  local cellmeta = require('ipynb.cellmeta')
+  local parts = {}
+  local title = cellmeta.title(cell)
+  if title then
+    parts[#parts + 1] = title
+  end
+  local tags = cellmeta.tags(cell)
+  if #tags > 0 then
+    parts[#parts + 1] = '#' .. table.concat(tags, ' #')
+  end
+  if cellmeta.is_source_hidden(cell) then
+    parts[#parts + 1] = '(code hidden)'
+  end
+  return table.concat(parts, ' · ')
 end
 
 ---Format a run time the way notebook UIs do: 85ms, 1.2s, 2m 03s
@@ -357,8 +379,9 @@ end
 ---@param language string|nil Language for code cells
 ---@param top_hint table|nil Optional type conversion hint {icon, key}
 ---@param execution_time number|nil Seconds the last run took
+---@param annotation string|nil Cell title / tags shown after the label
 ---@return table[] Virtual text segments
-local function build_top_border(cell_type, execution_count, execution_state, width, border_hl, language, top_hint, execution_time)
+local function build_top_border(cell_type, execution_count, execution_state, width, border_hl, language, top_hint, execution_time, annotation)
   local icon = cell_icons[cell_type]
   local label_text = cell_type
 
@@ -413,6 +436,26 @@ local function build_top_border(cell_type, execution_count, execution_state, wid
 
   -- Calculate fill width using display width for proper unicode handling
   local used_width = display_width(left) + display_width(label) + display_width(hint_prefix) + display_width(hint_text) + display_width(right_str) + display_width(right)
+
+  -- Title/tags take whatever room is left, truncated with an ellipsis
+  annotation = annotation or ''
+  if annotation ~= '' then
+    local room = width - used_width - 2
+    if room < 4 then
+      annotation = ''
+    elseif display_width(annotation) > room then
+      annotation = vim.fn.strcharpart(annotation, 0, room - 1)
+      while display_width(annotation) > room - 1 do
+        annotation = vim.fn.strcharpart(annotation, 0, vim.fn.strchars(annotation) - 1)
+      end
+      annotation = annotation .. '…'
+    end
+    if annotation ~= '' then
+      annotation = annotation .. ' '
+      used_width = used_width + display_width(annotation)
+    end
+  end
+
   local fill_width = width - used_width
   if fill_width < 0 then fill_width = 0 end
 
@@ -422,6 +465,9 @@ local function build_top_border(cell_type, execution_count, execution_state, wid
   local segments = {
     { left .. label, border_hl },
   }
+  if annotation ~= '' then
+    table.insert(segments, { annotation, 'IpynbCellTitle' })
+  end
 
   -- Add hint if provided (prefix in border color, text in hint color)
   if top_hint and fill_width >= 0 then
@@ -594,7 +640,8 @@ function M.render_cell(state, cell_idx, is_active, target_buf)
   -- Priority 150 = higher than treesitter (100) to override syntax highlighting
   local top_hint = hints and hints.top_hint or nil
   local top_border_segments = build_top_border(
-    cell.type, cell.execution_count, cell.execution_state, width, border_hl, language, top_hint, cell.execution_time
+    cell.type, cell.execution_count, cell.execution_state, width, border_hl, language, top_hint, cell.execution_time,
+    M.cell_annotation(cell)
   )
   vim.api.nvim_buf_set_extmark(buf, visual_ns, start_line, 0, {
     end_row = start_line,

@@ -466,6 +466,9 @@ function M.open(state, mode)
   elseif is_split_layout() then
     -- Split next to the notebook: the notebook stays scrollable while editing
     win = vim.api.nvim_open_win(buf, true, split_window_config(parent_win))
+    -- Don't inherit the notebook's fold/conceal options: use what the window had before
+    vim.w[win].ipynb_saved_options = vim.w[parent_win].ipynb_saved_options
+    require('ipynb.facade').reset_window(win)
     sync_edit_window_display_options(parent_win, win)
   else
     -- Open float anchored to cell position in buffer
@@ -930,6 +933,22 @@ function M.setup_edit_keymaps(state)
   vim.keymap.set({ 'n', 'i' }, '<S-CR>', execute_and_next,
     vim.tbl_extend('force', opts, { desc = 'Execute cell, move next' }))
 
+  -- Run only the selected code (Jupyter "Run Selected Text"); outputs go to this cell
+  local function execute_selection()
+    M.execute_selection(state)
+  end
+  for _, key in ipairs({ km.execute_cell, km.menu_execute_cell }) do
+    if key and key ~= '' then
+      vim.keymap.set('x', key, execute_selection, vim.tbl_extend('force', opts, { desc = 'Execute selection' }))
+    end
+  end
+
+  if km.split_cell and km.split_cell ~= '' then
+    vim.keymap.set({ 'n', 'i' }, km.split_cell, function()
+      M.split_cell(state)
+    end, vim.tbl_extend('force', opts, { desc = 'Split cell at cursor' }))
+  end
+
   -- Fallback for terminals without <S-CR> support
   vim.keymap.set('n', km.menu_execute_and_next, execute_and_next,
     vim.tbl_extend('force', opts, { desc = 'Execute cell, move next' }))
@@ -1040,6 +1059,59 @@ function M.setup_edit_keymaps(state)
   -- - vim.lsp.util.make_position_params (rewrites URI and line offset)
   -- - vim.lsp.get_clients (returns shadow buffer's clients)
   -- - vim.lsp.buf_request (redirects to shadow buffer)
+end
+
+---Run the visual selection of the edit buffer in the kernel
+---@param state NotebookState
+function M.execute_selection(state)
+  local edit = state.edit_state
+  if not edit then
+    return
+  end
+  local mode = vim.fn.mode()
+  local lines = vim.fn.getregion(vim.fn.getpos('v'), vim.fn.getpos('.'), { type = mode })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes('<Esc>', true, false, true), 'nx', false)
+  local cell = state.cells[edit.cell_idx]
+  if cell and cell.type == 'code' and #lines > 0 then
+    require('ipynb.kernel').execute(state, edit.cell_idx, table.concat(lines, '\n'))
+  end
+end
+
+---Split the edited cell at the cursor (Jupyter "Split Cell"): text before the
+---cursor stays, the rest becomes a new cell below, which is then edited.
+---@param state NotebookState
+function M.split_cell(state)
+  local edit = state.edit_state
+  if not edit then
+    return
+  end
+  if vim.fn.mode():match('^i') then
+    vim.cmd('stopinsert')
+  end
+  local row, col = unpack(vim.api.nvim_win_get_cursor(edit.win))
+  local lines = vim.api.nvim_buf_get_lines(edit.buf, 0, -1, false)
+  local current = lines[row] or ''
+  local before = vim.list_slice(lines, 1, row - 1)
+  if col > 0 then
+    table.insert(before, current:sub(1, col))
+  end
+  local after = { current:sub(col + 1) }
+  vim.list_extend(after, vim.list_slice(lines, row + 1))
+
+  local idx = edit.cell_idx
+  M.close(state)
+  local cell = state.cells[idx]
+  if not cell then
+    return
+  end
+  cell.source = table.concat(before, '\n')
+  local new_idx = require('ipynb.state').insert_cell(state, idx, cell.type)
+  state.cells[new_idx].source = table.concat(after, '\n')
+  require('ipynb.facade').refresh(state)
+
+  local start_line = require('ipynb.cells').get_cell_range(state, new_idx)
+  vim.api.nvim_win_set_cursor(0, { start_line + 2, 0 })
+  M.open(state)
 end
 
 ---Perform global undo or redo on facade buffer and refresh edit buffer

@@ -13,6 +13,10 @@ local M = {}
 ---@field folding FoldingConfig
 ---@field format FormatConfig
 ---@field shadow ShadowConfig
+---@field output OutputConfig
+
+---@class OutputConfig
+---@field max_lines number Text lines shown inline per cell before truncating (0 = no limit)
 
 ---@class FloatConfig
 ---@field layout "overlay"|"split" Cell editor: float over the cell, or a split next to the notebook
@@ -46,6 +50,16 @@ local M = {}
 ---@field menu_execute_cell string Execute cell (menu) (default: '<leader>kx')
 ---@field menu_execute_and_next string Execute cell, move next (menu) (default: '<leader>kX')
 ---@field execute_all_below string|nil Execute all cells from current to end (default: nil, unmapped)
+---@field execute_all_above string|nil Execute all cells above the current one (default: nil)
+---@field execute_all string|nil Execute all cells (default: nil)
+---@field restart_and_run_all string|nil Restart kernel then run all cells (default: nil)
+---@field copy_cell string|nil Copy cell to the cell register (default: 'yy')
+---@field merge_cell_below string|nil Merge cell with the one below (default: nil)
+---@field split_cell string|nil Split the edited cell at the cursor, in the cell editor (default: nil)
+---@field toggle_source_hidden string|nil Hide/show cell code (default: nil)
+---@field toggle_outputs_hidden string|nil Hide/show cell outputs (default: nil)
+---@field open_output_external string|nil Open rich output in the system viewer (default: nil)
+---@field edit_tags string|nil Edit cell tags (default: nil)
 ---@field kernel_interrupt string Interrupt kernel (menu) (default: '<leader>ki')
 ---@field kernel_restart string Restart kernel (default: '<leader>k0')
 ---@field kernel_start string Start kernel (default: '<leader>ks')
@@ -75,6 +89,7 @@ local M = {}
 ---@field exec_count string Execution count [N] (default: 'Number')
 ---@field output string Output text (default: 'Comment')
 ---@field output_error string Error output (default: 'DiagnosticError')
+---@field output_stderr string stderr stream output (default: 'DiagnosticWarn')
 ---@field executing string Executing indicator (default: 'DiagnosticWarn')
 ---@field queued string Queued indicator (default: 'DiagnosticHint')
 ---@field hint string Action hints on active cell border (default: 'Comment')
@@ -139,6 +154,16 @@ M.defaults = {
 		menu_execute_cell = "<leader>kx",
 		menu_execute_and_next = "<leader>kX",
 		execute_all_below = nil, -- Unmapped by default; set to e.g. '<leader>kA' to enable
+		execute_all_above = nil, -- Run all cells above the current one (unmapped)
+		execute_all = nil, -- Run all cells (unmapped)
+		restart_and_run_all = nil, -- Restart kernel, then run all cells (unmapped)
+		copy_cell = "yy", -- Copy cell to the cell register
+		merge_cell_below = nil, -- Merge current cell with the one below (unmapped)
+		split_cell = nil, -- Split the edited cell at the cursor (cell editor, unmapped)
+		toggle_source_hidden = nil, -- Hide/show the cell's code, saved like JupyterLab (unmapped)
+		toggle_outputs_hidden = nil, -- Hide/show the cell's outputs, saved like JupyterLab (unmapped)
+		open_output_external = nil, -- Open image/HTML output in the system viewer (unmapped)
+		edit_tags = nil, -- Edit the cell's tags (unmapped)
 		kernel_interrupt = "<leader>ki",
 		kernel_restart = "<leader>k0",
 		kernel_start = "<leader>ks",
@@ -158,6 +183,7 @@ M.defaults = {
 		exec_count = "Number",
 		output = "Comment",
 		output_error = "DiagnosticError",
+		output_stderr = "DiagnosticWarn",
 		executing = "DiagnosticWarn",
 		queued = "DiagnosticHint",
 		hint = "Comment",
@@ -166,6 +192,9 @@ M.defaults = {
 		enabled = true,
 		show_on_hover = true,
 		show_on_edit = true,
+	},
+	output = {
+		max_lines = 100, -- inline text lines per cell; the rest via open_output (0 = no limit)
 	},
 	kernel = {
 		auto_connect = false,

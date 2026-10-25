@@ -223,6 +223,23 @@ function M.setup_facade_keymaps(state)
     M.execute_all_below(state)
   end, vim.tbl_extend('force', opts, { desc = 'Execute all below' }))
 
+  -- Optional actions (unmapped unless configured)
+  local kernel = require('ipynb.kernel')
+  local optional = {
+    { km.execute_all_above, function() kernel.execute_all_above(state) end, 'Execute all above' },
+    { km.execute_all, function() kernel.execute_range(state, 1, #state.cells) end, 'Execute all cells' },
+    { km.restart_and_run_all, function() kernel.restart_and_run_all(state) end, 'Kernel restart, run all' },
+    { km.copy_cell, function() M.copy_cell(state) end, 'Cell copy' },
+    { km.merge_cell_below, function() M.merge_cell_below(state) end, 'Cell merge with below' },
+    { km.toggle_source_hidden, function() require('ipynb.folding').toggle_source_hidden(state) end, 'Cell hide/show code' },
+    { km.toggle_outputs_hidden, function() require('ipynb.output').toggle_outputs_hidden(state) end, 'Cell hide/show outputs' },
+    { km.open_output_external, function() require('ipynb.output').open_external(state) end, 'Output open in system viewer' },
+    { km.edit_tags, function() M.edit_tags(state) end, 'Cell edit tags' },
+  }
+  for _, map in ipairs(optional) do
+    set_keymap_if_configured('n', map[1], map[2], vim.tbl_extend('force', opts, { desc = map[3] }))
+  end
+
   vim.keymap.set('n', km.kernel_interrupt, interrupt_kernel_cb,
     vim.tbl_extend('force', opts, { desc = 'Kernel interrupt' }))
 
@@ -295,6 +312,74 @@ function M.setup_facade_keymaps(state)
   register_which_key()
 end
 
+---Snapshot of a cell for the cell register (outputs, metadata and attachments included)
+---@param cell Cell
+---@return table
+local function copy_of(cell)
+  return {
+    type = cell.type,
+    source = cell.source,
+    outputs = cell.outputs and vim.deepcopy(cell.outputs) or nil,
+    execution_count = cell.execution_count,
+    metadata = vim.deepcopy(cell.metadata or {}),
+    attachments = cell.attachments and vim.deepcopy(cell.attachments) or nil,
+  }
+end
+
+---Copy current cell to register (Jupyter command-mode "c")
+---@param state NotebookState
+function M.copy_cell(state)
+  local _, cell = get_cell_at_cursor(state)
+  if cell then
+    cell_register = copy_of(cell)
+    vim.notify('Cell copied', vim.log.levels.INFO)
+  end
+end
+
+---Merge the current cell with the one below (Jupyter "Merge Cell Below")
+---@param state NotebookState
+function M.merge_cell_below(state)
+  local idx, cell = get_cell_at_cursor(state)
+  local below = idx and state.cells[idx + 1]
+  if not cell or not below then
+    vim.notify('No cell below to merge', vim.log.levels.WARN)
+    return
+  end
+  cell.source = cell.source .. '\n' .. below.source
+  if cell.type == 'code' then
+    -- The merged code has not run as a whole
+    require('ipynb.output').clear_outputs(state, idx)
+    cell.execution_count = nil
+  elseif below.attachments then
+    cell.attachments = vim.tbl_extend('keep', cell.attachments or {}, below.attachments)
+  end
+  require('ipynb.state').delete_cell(state, idx + 1)
+  require('ipynb.facade').refresh(state)
+  move_cursor_to_cell(state, idx)
+end
+
+---Edit the current cell's tags (metadata.tags, as in JupyterLab)
+---@param state NotebookState
+function M.edit_tags(state)
+  local idx, cell = get_cell_at_cursor(state)
+  if not cell then
+    return
+  end
+  local cellmeta = require('ipynb.cellmeta')
+  vim.ui.input({ prompt = 'Cell tags (space separated): ', default = table.concat(cellmeta.tags(cell), ' ') }, function(input)
+    if input == nil then
+      return
+    end
+    local current = state.cells[idx]
+    if current ~= cell then
+      return
+    end
+    cellmeta.set_tags(cell, vim.split(input, '[%s,]+', { trimempty = true }))
+    vim.bo[state.facade_buf].modified = true
+    require('ipynb.visuals').render_all(state)
+  end)
+end
+
 ---Cut current cell to register
 ---@param state NotebookState
 function M.cut_cell(state)
@@ -309,13 +394,7 @@ function M.cut_cell(state)
   local cell_idx, cell = get_cell_at_cursor(state)
 
   if cell_idx and cell then
-    -- Save to register (deep copy)
-    cell_register = {
-      type = cell.type,
-      source = cell.source,
-      outputs = cell.outputs and vim.deepcopy(cell.outputs) or nil,
-      execution_count = cell.execution_count,
-    }
+    cell_register = copy_of(cell)
 
     facade_mod.delete_cell(state, cell_idx)
 
@@ -346,8 +425,11 @@ function M.paste_cell(state, position)
   -- Copy content from register
   local new_cell = state.cells[new_idx]
   new_cell.source = cell_register.source
+  new_cell.metadata = vim.deepcopy(cell_register.metadata or {})
+  new_cell.attachments = cell_register.attachments and vim.deepcopy(cell_register.attachments) or nil
   if cell_register.outputs then
     new_cell.outputs = vim.deepcopy(cell_register.outputs)
+    new_cell.execution_count = cell_register.execution_count
   end
 
   -- Refresh to show pasted content

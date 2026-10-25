@@ -135,6 +135,75 @@ function M.fold_all_cells(state, action)
   end
 end
 
+---Find a window showing the notebook (current window preferred)
+---@param state NotebookState
+---@return number|nil
+local function facade_window(state)
+  if vim.api.nvim_win_get_buf(0) == state.facade_buf then
+    return vim.api.nvim_get_current_win()
+  end
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_get_buf(win) == state.facade_buf then
+      return win
+    end
+  end
+end
+
+---Open or close the content fold of one cell
+---@param state NotebookState
+---@param cell_idx number
+---@param close boolean
+---@return boolean folded_or_opened
+function M.set_cell_folded(state, cell_idx, close)
+  local cells_mod = require('ipynb.cells')
+  local win = facade_window(state)
+  local content_start, content_end = cells_mod.get_content_range(state, cell_idx)
+  if not win or not content_start or content_end <= content_start then
+    return false
+  end
+  return vim.api.nvim_win_call(win, function()
+    vim.cmd('silent! normal! zx') -- make sure folds reflect the current text
+    local line = content_start + 1
+    if vim.fn.foldlevel(line) == 0 then
+      return false
+    end
+    local closed = vim.fn.foldclosed(line) ~= -1
+    if close ~= closed then
+      exec_fold_at(line, close and 'zc' or 'zo')
+    end
+    return true
+  end)
+end
+
+---Close the folds of cells whose code is hidden (JupyterLab source_hidden,
+---Colab forms). Called when the notebook is shown in a window.
+---@param state NotebookState
+function M.apply_hidden_sources(state)
+  local cellmeta = require('ipynb.cellmeta')
+  for i, cell in ipairs(state.cells) do
+    if cellmeta.is_source_hidden(cell) then
+      M.set_cell_folded(state, i, true)
+    end
+  end
+end
+
+---Toggle "hide code" for the cell at cursor; saved like JupyterLab does
+---@param state NotebookState
+function M.toggle_source_hidden(state)
+  local cells_mod = require('ipynb.cells')
+  local cellmeta = require('ipynb.cellmeta')
+  local idx, cell = cells_mod.get_cell_at_line(state, vim.api.nvim_win_get_cursor(0)[1] - 1)
+  if not cell then
+    return
+  end
+  local hide = not cellmeta.is_source_hidden(cell)
+  cellmeta.set_source_hidden(cell, hide)
+  if not M.set_cell_folded(state, idx, hide) and hide then
+    vim.notify('Code hidden in the saved notebook (single-line cells cannot be folded here)', vim.log.levels.INFO)
+  end
+  vim.bo[state.facade_buf].modified = true
+end
+
 ---Toggle fold for the cell at cursor (not language constructs)
 ---Works regardless of whether cursor is on content or border lines
 ---@param state NotebookState

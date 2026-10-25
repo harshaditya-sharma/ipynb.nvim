@@ -38,6 +38,65 @@ function M.start_treesitter(buf)
   end))
 end
 
+local WINDOW_OPTIONS = {
+  conceallevel = 2, -- rounded borders
+  concealcursor = 'nc', -- conceal in normal and command mode
+  signcolumn = 'auto', -- diagnostics
+  -- Cell folding (content only; markers stay visible), all open by default
+  foldmethod = 'expr',
+  foldexpr = "v:lua.require'ipynb.folding'.foldexpr()",
+  foldtext = "v:lua.require'ipynb.folding'.foldtext()",
+  foldlevel = 99,
+  foldenable = true,
+}
+
+local function win_option(win, name)
+  return vim.api.nvim_get_option_value(name, { win = win })
+end
+
+---Put back the options a window had before it showed the notebook
+---@param win number
+function M.reset_window(win)
+  local saved = vim.w[win].ipynb_saved_options
+  vim.w[win].ipynb_saved_options = nil
+  if type(saved) ~= 'table' then
+    return
+  end
+  for name, value in pairs(saved) do
+    pcall(vim.api.nvim_set_option_value, name, value, { win = win })
+  end
+end
+
+---Window options for a window showing the notebook. Neovim copies a window's
+---options to any new buffer opened in it, so the previous values are saved
+---and restored when a non-notebook buffer takes over the window.
+---@param win number
+function M.setup_window(win)
+  if vim.w[win].ipynb_saved_options == nil then
+    local saved = {}
+    for name in pairs(WINDOW_OPTIONS) do
+      saved[name] = win_option(win, name)
+    end
+    vim.w[win].ipynb_saved_options = saved
+  end
+  for name, value in pairs(WINDOW_OPTIONS) do
+    vim.api.nvim_set_option_value(name, value, { scope = 'local', win = win })
+  end
+
+  if not M._window_reset_installed then
+    M._window_reset_installed = true
+    vim.api.nvim_create_autocmd('BufWinEnter', {
+      group = vim.api.nvim_create_augroup('IpynbWindowReset', { clear = true }),
+      callback = function(args)
+        local w = vim.api.nvim_get_current_win()
+        if vim.w[w].ipynb_saved_options ~= nil and not vim.b[args.buf].notebook_facade then
+          M.reset_window(w)
+        end
+      end,
+    })
+  end
+end
+
 ---Create and configure the facade buffer
 ---@param state NotebookState
 ---@param buf number|nil Existing buffer to use, or nil to create new
@@ -99,12 +158,8 @@ function M.create(state, buf)
   vim.api.nvim_create_autocmd('BufWinEnter', {
     buffer = buf,
     callback = function()
-      local win = vim.api.nvim_get_current_win()
-      -- Enable concealment for rounded borders
-      vim.wo[win].conceallevel = 2
-      vim.wo[win].concealcursor = 'nc' -- Conceal in normal and command mode
-      -- Ensure sign column is visible for diagnostics
-      vim.wo[win].signcolumn = 'auto'
+      M.setup_window(vim.api.nvim_get_current_win())
+      require('ipynb.folding').apply_hidden_sources(state)
     end,
   })
 

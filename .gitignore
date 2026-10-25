@@ -29,3 +29,6 @@ tree-sitter-ipynb/src/tree_sitter/array.h
 .ipynb_checkpoints/
 .ipynb.nvim/
 doc/tags
+
+# Shadow files the LSP tests write next to fixtures
+tests/fixtures/ipynb.nvim/

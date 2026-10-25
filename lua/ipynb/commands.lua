@@ -132,6 +132,36 @@ function M.setup_buffer(state)
     { 'NotebookExecuteAndNext', call('ipynb.keymaps', 'execute_and_next', state), 'Execute cell and move to next' },
     { 'NotebookExecuteAllBelow', call('ipynb.keymaps', 'execute_all_below', state), 'Execute all cells from current to end' },
     { 'NotebookExecuteAll', call('ipynb.kernel', 'execute_all_below', state, 1), 'Execute all code cells in the notebook' },
+    { 'NotebookExecuteAllAbove', call('ipynb.kernel', 'execute_all_above', state), 'Execute all cells above the current one' },
+    { 'NotebookRestartAndRunAll', call('ipynb.kernel', 'restart_and_run_all', state), 'Restart kernel, then run all cells' },
+    -- More cell operations
+    { 'NotebookCopyCell', call('ipynb.keymaps', 'copy_cell', state), 'Copy cell to register' },
+    { 'NotebookMergeCellBelow', call('ipynb.keymaps', 'merge_cell_below', state), 'Merge cell with the one below' },
+    { 'NotebookSplitCell', function()
+      if not state.edit_state then
+        require('ipynb.edit').open(state)
+      end
+      require('ipynb.edit').split_cell(state)
+    end, 'Split cell at cursor' },
+    { 'NotebookToggleSourceHidden', call('ipynb.folding', 'toggle_source_hidden', state), 'Hide/show cell code' },
+    { 'NotebookToggleOutputsHidden', call('ipynb.output', 'toggle_outputs_hidden', state), 'Hide/show cell outputs' },
+    { 'NotebookOpenOutput', call('ipynb.output', 'open_external', state), 'Open image/HTML/plot output externally' },
+    { 'NotebookCellTags', function(opts)
+      if opts.args == '' then
+        keymaps.edit_tags(state)
+        return
+      end
+      local _, cell = current_cell()
+      if cell then
+        require('ipynb.cellmeta').set_tags(cell, opts.fargs)
+        vim.bo[buf].modified = true
+        require('ipynb.visuals').render_all(state)
+      end
+    end, 'Edit cell tags', { nargs = '*' } },
+    { 'NotebookExport', function(opts) kernel.export(state, opts.args) end, 'Export with nbconvert', {
+      nargs = 1,
+      complete = function() return kernel.EXPORT_FORMATS end,
+    } },
     -- Kernel
     { 'NotebookKernelStart', function(opts)
       kernel.connect(state, { python_path = opts.args ~= '' and opts.args or nil })

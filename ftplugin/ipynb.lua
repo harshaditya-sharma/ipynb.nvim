@@ -1,11 +1,7 @@
 -- ftplugin/ipynb.lua - Filetype settings for notebook buffers
--- Note: Treesitter highlighting is started by facade.lua using the ipynb grammar
+-- Note: Treesitter highlighting is started by facade.lua using the ipynb grammar.
+-- Fold and conceal settings are window options; facade.setup_window sets them
+-- per notebook window and restores the previous values when another buffer is
+-- shown there (vim.wo here would leak them into every later buffer).
 
--- Window settings - custom folding for cell content
-vim.wo.foldmethod = "expr"
-vim.wo.foldexpr = 'v:lua.require("ipynb.folding").foldexpr()'
-vim.wo.foldtext = 'v:lua.require("ipynb.folding").foldtext()'
-vim.wo.foldenable = true
-vim.wo.foldlevel = 99 -- Start all unfolded
 vim.opt_local.fillchars:append({ fold = " " }) -- Clean fold fill
-

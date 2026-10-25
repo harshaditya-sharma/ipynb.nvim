@@ -411,10 +411,15 @@ local function handle_message(state, msg)
       end
     end
     request_render(state)
+    local after_restart = msg_type == "restarted" and kernel.callbacks.restarted
+    kernel.callbacks.restarted = nil
     vim.schedule(function()
       close_input_prompt(state)
       if msg_type == "restarted" then
         vim.notify("Kernel restarted", vim.log.levels.INFO)
+      end
+      if after_restart then
+        after_restart()
       end
     end)
 
@@ -700,8 +705,9 @@ end
 ---Execute a code cell
 ---@param state NotebookState
 ---@param cell_idx number
+---@param code string|nil Code to run instead of the whole cell (e.g. a selection)
 ---@return boolean success
-function M.execute(state, cell_idx)
+function M.execute(state, cell_idx, code)
   if not state.kernel or not state.kernel.connected then
     vim.notify("No kernel connected. Use :NotebookKernelStart", vim.log.levels.WARN)
     return false
@@ -737,7 +743,7 @@ function M.execute(state, cell_idx)
 
   return send_command(state, {
     action = "execute",
-    code = cell.source,
+    code = code or cell.source,
     cell_id = cell.id,
   })
 end
@@ -763,6 +769,41 @@ function M.execute_all_below(state, start_idx)
   for _, idx in ipairs(to_execute) do
     M.execute(state, idx)
   end
+end
+
+---Execute the code cells in [from, to]
+---@param state NotebookState
+---@param from number
+---@param to number
+function M.execute_range(state, from, to)
+  for i = math.max(from, 1), math.min(to, #state.cells) do
+    if state.cells[i].type == "code" then
+      M.execute(state, i)
+    end
+  end
+end
+
+---Execute all cells above `cell_idx` (Jupyter "Run All Above": not the cell itself)
+---@param state NotebookState
+---@param cell_idx number|nil Defaults to the cell at the cursor
+function M.execute_all_above(state, cell_idx)
+  if not cell_idx then
+    cell_idx = require("ipynb.cells").get_cell_at_line(state, vim.api.nvim_win_get_cursor(0)[1] - 1) or 1
+  end
+  M.execute_range(state, 1, cell_idx - 1)
+end
+
+---Restart the kernel (clearing outputs), then run every cell once it is back
+---@param state NotebookState
+function M.restart_and_run_all(state)
+  if not (state.kernel and state.kernel.connected) then
+    vim.notify("No kernel connected. Use :NotebookKernelStart", vim.log.levels.WARN)
+    return
+  end
+  state.kernel.callbacks.restarted = function()
+    M.execute_range(state, 1, #state.cells)
+  end
+  M.restart(state, true)
 end
 
 ---Interrupt kernel execution
@@ -1056,6 +1097,43 @@ function M.ping(state, callback)
   end, 2000)
 
   send_command(state, { action = "ping" })
+end
+
+M.EXPORT_FORMATS = { 'html', 'pdf', 'webpdf', 'markdown', 'script', 'python', 'latex', 'rst', 'asciidoc', 'slides' }
+
+---Export the saved notebook with `jupyter nbconvert` (same Python as the kernel)
+---@param state NotebookState
+---@param format string One of M.EXPORT_FORMATS ("python" is an alias for "script")
+function M.export(state, format)
+  if not vim.tbl_contains(M.EXPORT_FORMATS, format) then
+    vim.notify('Unknown export format: ' .. tostring(format) .. ' (' .. table.concat(M.EXPORT_FORMATS, ', ') .. ')',
+      vim.log.levels.ERROR)
+    return
+  end
+  local python = discover_python(state.source_path, nil)
+  if not python then
+    vim.notify('Python not found for nbconvert', vim.log.levels.ERROR)
+    return
+  end
+  if vim.bo[state.facade_buf].modified then
+    require('ipynb.io').save_notebook(state.facade_buf)
+  end
+  local to = format == 'python' and 'script' or format
+  vim.notify('Exporting to ' .. format .. '...', vim.log.levels.INFO)
+  vim.system({ python, '-m', 'jupyter', 'nbconvert', '--to', to, state.source_path }, { text = true }, function(r)
+    vim.schedule(function()
+      if r.code ~= 0 then
+        local msg = vim.trim(r.stderr or '')
+        if msg:find('No module named') then
+          msg = msg .. '\nInstall it with: ' .. python .. ' -m pip install nbconvert'
+        end
+        vim.notify('nbconvert failed:\n' .. msg, vim.log.levels.ERROR)
+        return
+      end
+      local written = (r.stderr or ''):match('[Ww]riting %d+ bytes to ([^\r\n]+)')
+      vim.notify('Exported: ' .. (written or state.source_path), vim.log.levels.INFO)
+    end)
+  end)
 end
 
 ---List available Jupyter kernels
