@@ -169,14 +169,12 @@ end
 ---@param data string Base64 encoded data
 ---@return string|nil decoded Binary data or nil on failure
 local function base64_decode(data)
-	if vim.base64 and vim.base64.decode then
-		local ok, decoded = pcall(vim.base64.decode, data)
-		if ok then
-			return decoded
-		end
-	end
-	return nil
+	-- Jupyter stores base64 with line breaks / a trailing newline, which
+	-- vim.base64.decode rejects
+	local ok, decoded = pcall(vim.base64.decode, (data:gsub("%s", "")))
+	return ok and decoded or nil
 end
+M._base64_decode = base64_decode
 
 ---Write binary data to file using libuv
 ---@param path string File path
@@ -330,7 +328,9 @@ function M.get_image_virt_lines(state, cell, output, image_index)
 	local cache_dir = get_cache_dir()
 	local ext = MIME_EXTENSIONS[mime] or "png"
 	local data_hash = vim.fn.sha256(image_data):sub(1, 12)
-	local filename = string.format("%s-%d-%s.%s", cell_id, image_index, data_hash, ext)
+	-- IDs are validated on load; sanitize again so a file name can never leave the cache dir
+	local safe_id = cell_id:gsub("[^%w_-]", "_")
+	local filename = string.format("%s-%d-%s.%s", safe_id, image_index, data_hash, ext)
 	local path = cache_dir .. "/" .. filename
 
 	if not write_binary_file(path, file_content) then

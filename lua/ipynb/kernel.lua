@@ -851,6 +851,23 @@ function M.get_info(state)
   }
 end
 
+---Kernel info as display lines (used by :NotebookInfo and :NotebookKernelStatus)
+---@param state NotebookState
+---@return string[]
+function M.format_info(state)
+  local info = M.get_info(state)
+  local lines = {
+    'Kernelspec: ' .. info.kernelspec,
+    'Python: ' .. (info.python_path or 'not found') .. ' (' .. info.python_source .. ')',
+    'Connected: ' .. tostring(info.connected),
+    'State: ' .. info.execution_state,
+  }
+  if info.running_kernel then
+    table.insert(lines, 'Running kernel: ' .. info.running_kernel)
+  end
+  return lines
+end
+
 ---Get statusline component for kernel status
 ---@param state NotebookState|nil
 ---@return string status Status string for statusline

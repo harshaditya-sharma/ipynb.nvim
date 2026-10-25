@@ -223,6 +223,13 @@ h.run_test('notebook_opens_before_parser_is_installed', function()
   h.assert_true(retried, 'highlighting should start once the parser is available')
 end)
 
+h.run_test('saved_images_with_line_breaks_decode', function()
+  local decode = require('ipynb.images')._base64_decode
+  h.assert_eq(decode('QUJD\n'), 'ABC', 'trailing newline (how Jupyter saves PNGs)')
+  h.assert_eq(decode('QUJD\nREVG\n'), 'ABCDEF', 'wrapped base64')
+  h.assert_eq(decode('QUJD\r\n'), 'ABC', 'CRLF')
+end)
+
 --------------------------------------------------------------------------------
 -- IPython syntax vs Python language servers
 --------------------------------------------------------------------------------
@@ -334,6 +341,22 @@ h.run_test('notebook_info_and_picker_handle_null_execution_count', function()
   vim.fn.delete(p)
   h.assert_true(ok, 'picker should not error: ' .. tostring(err))
   h.assert_true(items and #items == 1, 'picker lists the cell')
+end)
+
+h.run_test('all_documented_commands_exist', function()
+  local readme = table.concat(vim.fn.readfile(vim.fn.fnamemodify(h.fixture_path(''), ':h:h:h') .. '/README.md'), '\n')
+  h.open_notebook('mixed.ipynb')
+  local buffer_cmds = vim.api.nvim_buf_get_commands(0, {})
+  local global_cmds = vim.api.nvim_get_commands({})
+  local count = 0
+  for name in readme:gmatch('| `:(Notebook%a+)') do
+    count = count + 1
+    h.assert_true(buffer_cmds[name] ~= nil or global_cmds[name] ~= nil, 'missing command :' .. name)
+  end
+  h.assert_true(count >= 35, 'README command table parsed (' .. count .. ')')
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  vim.cmd('NotebookInfo')
+  vim.cmd('NotebookKernelStatus')
 end)
 
 --------------------------------------------------------------------------------

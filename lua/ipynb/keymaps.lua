@@ -507,21 +507,10 @@ end
 ---Show kernel info
 ---@param state NotebookState
 function M.kernel_info(state)
-  local kernel = require('ipynb.kernel')
-  local info = kernel.get_info(state)
-
-  local lines = {
-    'Kernel Info:',
-    '  Kernelspec: ' .. info.kernelspec,
-    '  Python: ' .. (info.python_path or 'not found') .. ' (' .. info.python_source .. ')',
-    '  Connected: ' .. tostring(info.connected),
-    '  State: ' .. info.execution_state,
-  }
-
-  if info.running_kernel then
-    table.insert(lines, '  Running kernel: ' .. info.running_kernel)
+  local lines = { 'Kernel Info:' }
+  for _, line in ipairs(require('ipynb.kernel').format_info(state)) do
+    table.insert(lines, '  ' .. line)
   end
-
   vim.notify(table.concat(lines, '\n'), vim.log.levels.INFO)
 end
 
