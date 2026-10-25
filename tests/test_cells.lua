@@ -3,6 +3,18 @@
 
 local h = require('tests.helpers')
 
+---Overlay geometry tests only make sense with the floating editor
+local function overlay_test(name, fn)
+  h.run_test(name, function()
+    local float = require('ipynb.config').get().float
+    local saved = float.layout
+    float.layout = 'overlay'
+    local ok, err = pcall(fn)
+    float.layout = saved
+    assert(ok, err)
+  end)
+end
+
 print('')
 print(string.rep('=', 60))
 print('Running cell boundary tests')
@@ -184,7 +196,7 @@ end)
 -- With wrap enabled, a single logical line can occupy multiple screen rows.
 -- Expected: the edit float grows to fully cover the wrapped facade content.
 --------------------------------------------------------------------------------
-h.run_test('edit_overlay_matches_wrapped_height', function()
+overlay_test('edit_overlay_matches_wrapped_height', function()
   if not vim.api.nvim_win_text_height then
     return
   end
@@ -226,7 +238,7 @@ end)
 -- Creating a split shrinks the parent notebook window.
 -- Expected: the overlay width updates instead of spilling into the neighbor.
 --------------------------------------------------------------------------------
-h.run_test('edit_overlay_resizes_with_parent_window', function()
+overlay_test('edit_overlay_resizes_with_parent_window', function()
   h.open_notebook('mixed.ipynb')
   h.enter_cell(1)
 

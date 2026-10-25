@@ -123,6 +123,8 @@ end
 
 -- Load the plugin
 require('ipynb').setup({
+  -- IPYNB_TEST_LAYOUT=split runs any suite with the split cell editor
+  float = { layout = vim.env.IPYNB_TEST_LAYOUT or 'overlay' },
   shadow = {
     location = 'workspace',
     dir = 'ipynb.nvim',

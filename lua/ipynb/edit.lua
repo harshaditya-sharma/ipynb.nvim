@@ -87,6 +87,25 @@ install_changetracking_wrapper()
 
 local EDIT_ZINDEX = 40
 
+---@return boolean
+local function is_split_layout()
+  return require('ipynb.config').get().float.layout == 'split'
+end
+
+---Window config for a split editor next to (or below) the notebook window
+---@param parent_win number
+---@return table
+local function split_window_config(parent_win)
+  local split = require('ipynb.config').get().float.split or {}
+  local size = split.size or 0.45
+  if split.position == 'below' or split.position == 'above' then
+    local height = vim.api.nvim_win_get_height(parent_win)
+    return { split = split.position, win = parent_win, height = math.max(3, math.floor(height * size)) }
+  end
+  local width = vim.api.nvim_win_get_width(parent_win)
+  return { split = split.position == 'left' and 'left' or 'right', win = parent_win, width = math.max(20, math.floor(width * size)) }
+end
+
 ---Match wrap-related display options so the overlay mirrors the facade.
 ---@param parent_win number
 ---@param win number
@@ -198,6 +217,12 @@ local function refresh_edit_window(state)
 
   if not vim.api.nvim_win_is_valid(edit.parent_win) or vim.api.nvim_win_get_buf(edit.parent_win) ~= state.facade_buf then
     M.close(state)
+    return
+  end
+
+  if vim.api.nvim_win_get_config(edit.win).relative == '' then
+    -- Split layout: a normal window, nothing to align
+    sync_edit_window_display_options(edit.parent_win, edit.win)
     return
   end
 
@@ -395,9 +420,21 @@ function M.open(state, mode)
     return
   end
 
-  -- Close existing edit float if open (but keep buffer)
+  -- Close existing edit session (but keep buffer); a split window is reused
+  local reuse_win = state._reuse_win
+  state._reuse_win = nil
+  if reuse_win and not (vim.api.nvim_win_is_valid(reuse_win) and is_split_layout()) then
+    reuse_win = nil
+  end
   if state.edit_state then
-    M.close(state)
+    if is_split_layout() and vim.api.nvim_win_is_valid(state.edit_state.win)
+      and vim.api.nvim_win_get_config(state.edit_state.win).relative == '' then
+      reuse_win = state.edit_state.win
+    end
+    if state.edit_state.win == parent_win then
+      parent_win = state.edit_state.parent_win
+    end
+    M.close(state, { keep_window = reuse_win ~= nil })
   end
 
   -- Get cell content range
@@ -421,22 +458,32 @@ function M.open(state, mode)
   -- Calculate position and width based on the parent window's current geometry
   local float_col, float_width = get_edit_window_geometry(parent_win, config.float.show_line_numbers)
 
-  -- Open float anchored to cell position in buffer
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = 'win',
-    win = parent_win,
-    bufpos = { content_start, 0 }, -- 0-indexed line where content starts
-    row = 0,
-    col = float_col,
-    width = float_width,
-    height = height,
-    anchor = 'NW',
-    border = 'none', -- No border for seamless overlay
-    zindex = EDIT_ZINDEX,  -- Lower than default (50) so LSP floats appear on top
-  })
-
-  -- Copy window settings from parent to match appearance
-  sync_edit_window_chrome(parent_win, win, config.float.show_line_numbers)
+  local win
+  if reuse_win then
+    win = reuse_win
+    vim.api.nvim_win_set_buf(win, buf)
+    vim.api.nvim_set_current_win(win)
+  elseif is_split_layout() then
+    -- Split next to the notebook: the notebook stays scrollable while editing
+    win = vim.api.nvim_open_win(buf, true, split_window_config(parent_win))
+    sync_edit_window_display_options(parent_win, win)
+  else
+    -- Open float anchored to cell position in buffer
+    win = vim.api.nvim_open_win(buf, true, {
+      relative = 'win',
+      win = parent_win,
+      bufpos = { content_start, 0 }, -- 0-indexed line where content starts
+      row = 0,
+      col = float_col,
+      width = float_width,
+      height = height,
+      anchor = 'NW',
+      border = 'none', -- No border for seamless overlay
+      zindex = EDIT_ZINDEX,  -- Lower than default (50) so LSP floats appear on top
+    })
+    -- Copy window settings from parent to match appearance
+    sync_edit_window_chrome(parent_win, win, config.float.show_line_numbers)
+  end
 
   -- Store edit state (track by cell_id for stability across undo)
   state.edit_state = {
@@ -782,6 +829,36 @@ function M.setup_window_sync(state)
     callback = refresh_or_close,
   })
 
+  -- :q / <C-w>c on the editor window: end the session like <Esc> would
+  vim.api.nvim_create_autocmd('WinClosed', {
+    group = group,
+    pattern = tostring(edit.win),
+    callback = function()
+      vim.schedule(function()
+        if state.edit_state and state.edit_state.buf == edit_buf then
+          M.close(state)
+        end
+      end)
+    end,
+  })
+
+  -- The facade must be writable for syncing while the editor has focus, but
+  -- read-only while the user is looking at the notebook side (split layout).
+  vim.api.nvim_create_autocmd('WinEnter', {
+    group = group,
+    callback = function()
+      local current = state.edit_state
+      if not current or current.buf ~= edit_buf or not vim.api.nvim_buf_is_valid(state.facade_buf) then
+        return
+      end
+      local win = vim.api.nvim_get_current_win()
+      if win == current.win then
+        vim.bo[state.facade_buf].modifiable = true
+      elseif vim.api.nvim_win_get_buf(win) == state.facade_buf then
+        vim.bo[state.facade_buf].modifiable = false
+      end
+    end,
+  })
 end
 
 ---Setup keymaps for edit float
@@ -1091,7 +1168,8 @@ end
 
 ---Close edit float
 ---@param state NotebookState
-function M.close(state)
+---@param opts { keep_window: boolean }|nil keep_window: leave the window open (it is about to show another cell)
+function M.close(state, opts)
   if not state.edit_state then
     return
   end
@@ -1109,7 +1187,8 @@ function M.close(state)
   end
 
   -- Close window (buffer persists due to bufhidden='hide')
-  if vim.api.nvim_win_is_valid(edit.win) then
+  pcall(vim.api.nvim_del_augroup_by_name, edit_window_group_name(edit.buf))
+  if vim.api.nvim_win_is_valid(edit.win) and not (opts and opts.keep_window) then
     vim.api.nvim_win_close(edit.win, true)
   end
 
@@ -1156,7 +1235,11 @@ local function edit_adjacent_cell(state, direction)
   local valid = (direction > 0 and target_idx <= #state.cells) or (direction < 0 and target_idx >= 1)
 
   if valid then
-    M.close(state)
+    local keep = is_split_layout() and vim.api.nvim_win_get_config(state.edit_state.win).relative == ''
+    if keep then
+      state._reuse_win = state.edit_state.win
+    end
+    M.close(state, { keep_window = keep })
     local cells_mod = require('ipynb.cells')
     local start_line = cells_mod.get_cell_range(state, target_idx)
     vim.api.nvim_win_set_cursor(0, { start_line + 2, 0 })

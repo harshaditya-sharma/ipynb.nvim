@@ -15,10 +15,8 @@ local M = {}
 ---@field shadow ShadowConfig
 
 ---@class FloatConfig
----@field width number Window width as fraction of screen (0-1) - used for centered mode
----@field height number Window height as fraction of screen (0-1) - used for centered mode
----@field border string Border style - used for centered mode
----@field overlay boolean If true, float overlays cell inline; if false, centered popup
+---@field layout "overlay"|"split" Cell editor: float over the cell, or a split next to the notebook
+---@field split { position: "right"|"left"|"below"|"above", size: number } Split placement and size (fraction of the notebook window)
 ---@field show_line_numbers boolean Show line numbers in overlay mode
 
 ---@class KeymapConfig
@@ -110,10 +108,8 @@ local M = {}
 ---@type NotebookConfig
 M.defaults = {
 	float = {
-		width = 0.9,
-		height = 0.7,
-		border = "rounded",
-		overlay = true, -- true = inline overlay, false = centered popup
+		layout = "overlay", -- "overlay" = edit on top of the cell, "split" = edit in a split beside the notebook
+		split = { position = "right", size = 0.45 }, -- used when layout = "split"
 		show_line_numbers = false, -- line numbers in overlay mode (facade numbers visible behind)
 	},
 	--- TODO: make <leader>-_<prefix>_ key configurable?
