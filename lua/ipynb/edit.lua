@@ -876,7 +876,7 @@ function M.setup_edit_keymaps(state)
   -- Exit edit mode (Esc only, q reserved for macros)
   vim.keymap.set('n', '<Esc>', function()
     M.close(state)
-  end, vim.tbl_extend('force', opts, { desc = 'Close edit float' }))
+  end, vim.tbl_extend('force', opts, { desc = 'Close cell editor' }))
 
   -- Navigate to adjacent cells
   vim.keymap.set('n', '<C-j>', function()

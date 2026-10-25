@@ -11,6 +11,7 @@ CONTENTS                                                       *ipynb-contents*
     6. Commands ................................ |ipynb-commands|
     7. Troubleshooting ......................... |ipynb-troubleshooting|
     8. Statusline .............................. |ipynb-statusline|
+    9. Jupyter Compatibility ................... |ipynb-compatibility|
 
 ==============================================================================
 INTRODUCTION                                               *ipynb-introduction*
@@ -19,16 +20,21 @@ ipynb.nvim is a modal Jupyter notebook editor for Neovim.
 Requires Neovim 0.10+.
 
 Features:
-- Cell-based editing with floating windows for code isolation
+- Reads and writes .ipynb exactly like Jupyter (saving an untouched notebook
+  changes nothing; attachments, tags and app metadata are kept)
+- Cell-based editing in an overlay on the cell or in a split beside the
+  notebook (|ipynb-split-editor|)
 - Partial language server support (completion, diagnostics, go-to-definition,
-  references, rename, formatting) - most keymaps work but plugin compatibility varies
-- Jupyter kernel integration for code execution
-- Blocking stdin prompts (`input()`), with secure fallback for password prompts
-- Variable inspector using Jupyter inspect protocol (with auto-hover)
-- Multi-language support (Python, Julia, R, etc.)
-- Inline image rendering (requires snacks.nvim)
-- Cell folding to collapse cell content
-- Tree-sitter based syntax highlighting
+  references, rename, formatting); IPython magics are hidden from servers
+- Any Jupyter kernel: local, on a Jupyter server (|:NotebookServerConnect|),
+  or a connection file; iron.nvim REPL fallback when there is no kernel
+- Run all / above / below / selection, restart and run all, run times,
+  queued state, clear_output and display updates, input() prompts
+- Coloured tracebacks, readable HTML/Markdown fallbacks, truncated long
+  outputs, images inline (kitty, Sixel, iTerm2) or in your viewer
+- Tags, titles, hide code / hide outputs shared with JupyterLab, Colab and
+  Databricks (|ipynb-compatibility|)
+- Variable inspector, cell picker, folding, export (|:NotebookExport|)
 
 Open any .ipynb file and use `i` to enter Cell mode, `]]`/`[[` to navigate.
 
@@ -55,10 +61,7 @@ require('ipynb').setup({opts})
     Example with defaults: >lua
         require('ipynb').setup({
             float = {
-                width = 0.9,
-                height = 0.7,
-                border = 'rounded',
-                overlay = true,
+                layout = 'overlay', -- or 'split'
             },
             keymaps = {
                 next_cell = ']]',
@@ -140,17 +143,50 @@ NotebookConfig                                                  *NotebookConfig*
         {inspector}       (InspectorConfig)      Inspector settings
         {folding}         (FoldingConfig)        Cell folding settings
         {format}          (FormatConfig)         Cell formatting settings
+        {output}          (OutputConfig)         Inline output settings
+        {repl}            (ReplConfig)           iron.nvim REPL fallback
+        {shadow}          (ShadowConfig)         LSP shadow file location
 
 ------------------------------------------------------------------------------
 FloatConfig                                                        *FloatConfig*
 
     Fields: ~
-        {width}              (number)   Window width as fraction (0-1)
-                                        Default: 0.9
-        {height}             (number)   Window height as fraction (0-1)
-                                        Default: 0.7
-        {border}             (string)   Border style
-                                        Default: 'rounded'
+        {layout}             (string)   'overlay': edit on top of the cell
+                                        'split': edit in a split beside the
+                                        notebook |ipynb-split-editor|
+                                        Default: 'overlay'
+        {split}              (table)    { position = 'right'|'left'|'below'
+                                        |'above', size = fraction of the
+                                        notebook window }
+                                        Default: { position = 'right',
+                                        size = 0.45 }
+        {show_line_numbers}  (boolean)  Line numbers in the overlay
+                                        Default: false
+
+                                                          *ipynb-split-editor*
+    With `layout = 'split'` the cell editor is a normal window next to the
+    notebook. The notebook side stays scrollable (and read-only while it has
+    focus), so earlier cells and outputs remain visible while typing.
+    Pressing `i` on another cell, or <C-j>/<C-k> in the editor, reuses the
+    same split. <Esc>, |:quit| or <C-w>c end the edit session.
+
+------------------------------------------------------------------------------
+OutputConfig                                                      *OutputConfig*
+
+    Fields: ~
+        {max_lines}  (number)  Text lines shown under a cell before the rest
+                               is summarised ("N more lines"); 0 = no limit.
+                               |:NotebookOutput| always shows everything.
+                               Default: 100
+
+------------------------------------------------------------------------------
+ReplConfig                                                          *ReplConfig*
+
+    Fields: ~
+        {fallback}  (boolean)  With no Jupyter kernel connected, run cells in
+                               an iron.nvim REPL for the notebook language
+                               (output appears in the REPL window).
+                               Default: true
 
 ------------------------------------------------------------------------------
 KeymapConfig                                                      *KeymapConfig*
@@ -211,8 +247,34 @@ KeymapConfig                                                      *KeymapConfig*
                                          Default: '<leader>kx'
         {menu_execute_and_next}(string)  [N+C] Execute + next (menu)
                                          Default: '<leader>kX'
-        {execute_all_below}    (string)  [N+C] Execute all below
+        {execute_all_below}    (string)  [N] Execute all below
                                          Default: nil (unmapped)
+        {execute_all_above}    (string)  [N] Execute all cells above
+                                         Default: nil (unmapped)
+        {execute_all}          (string)  [N] Execute all cells
+                                         Default: nil (unmapped)
+        {restart_and_run_all}  (string)  [N] Restart kernel, run all
+                                         Default: nil (unmapped)
+        {copy_cell}            (string)  [N] Copy cell to register
+                                         Default: 'yy'
+        {merge_cell_below}     (string)  [N] Merge with the cell below
+                                         Default: nil (unmapped)
+        {split_cell}           (string)  [C] Split cell at cursor
+                                         Default: nil (unmapped)
+        {toggle_source_hidden} (string)  [N] Hide/show cell code
+                                         Default: nil (unmapped)
+        {toggle_outputs_hidden}(string)  [N] Hide/show cell outputs
+                                         Default: nil (unmapped)
+        {open_output_external} (string)  [N] Open image/HTML/plot externally
+                                         Default: nil (unmapped)
+        {edit_tags}            (string)  [N] Edit cell tags
+                                         Default: nil (unmapped)
+        {repl_send_cell}       (string)  [N+C] Send cell (or the selection
+                                         in the cell editor) to iron.nvim
+                                         Default: nil (unmapped)
+
+    In the cell editor, {execute_cell} and {menu_execute_cell} on a visual
+    selection run only the selected code.
         {kernel_interrupt}     (string)  [N+C] Interrupt kernel
                                          Default: '<leader>ki'
         {kernel_restart}       (string)  [N+C] Restart kernel
@@ -280,16 +342,32 @@ KernelConfig                                                      *KernelConfig*
                                       Default: true
         {python_path}   (string|nil)  Custom Python path for kernel bridge
                                       Default: nil (auto-discovered)
+        {record_timing} (boolean)     Save cell start/end times in cell
+                                      metadata like JupyterLab's "Record
+                                      cell timing" (run times are always
+                                      shown on the cell border)
+                                      Default: false
 
 ------------------------------------------------------------------------------
 ImageConfig                                                        *ImageConfig*
 
-    Requires snacks.nvim for inline image rendering in terminals that
-    support the kitty graphics protocol.
+    Inline images use the kitty protocol through snacks.nvim (kitty,
+    Ghostty), or Sixel (Windows Terminal 1.22+, foot; needs ImageMagick)
+    and iTerm2 graphics (iTerm2, WezTerm) on Neovim 0.12+. Anything else,
+    and PDFs / HTML / Plotly, open with |:NotebookOpenOutput|.
 
     Fields: ~
         {enabled}     (boolean)     Enable image rendering
                                     Default: true
+        {backend}     (string)      'auto', 'kitty', 'sixel', 'iterm2'
+                                    or 'none'
+                                    Default: 'auto' (detected)
+        {cell_size}   (table)       { width, height } of a terminal cell
+                                    in pixels, used to size Sixel images
+                                    (the terminal is asked first)
+                                    Default: { 10, 20 }
+        {max_rows}    (number)      Tallest Sixel/iTerm2 image, in rows
+                                    Default: 20
         {cache_dir}   (string)      Directory to cache decoded images
                                     Default: stdpath('cache') .. '/ipynb.nvim'
         {max_width}   (number|nil)  Max width in columns (nil = auto)
@@ -470,7 +548,10 @@ Execution: ~
     `:NotebookExecuteCell`         Execute current cell, stay
     `:NotebookExecuteAndNext`      Execute current cell, move to next
     `:NotebookExecuteAllBelow`     Execute all cells from current to end
+    `:NotebookExecuteAllAbove`     Execute all cells above the current one
     `:NotebookExecuteAll`          Execute all code cells
+    `:NotebookRestartAndRunAll`    Restart the kernel, then run all cells
+    `:NotebookReplSend`            Send cell to the iron.nvim REPL
 
 Kernel: ~
 
@@ -485,10 +566,23 @@ Kernel: ~
     `:NotebookSetKernel` {name}    Set kernel name in metadata
                                    Example: julia-1.10, ir, python3
     `:NotebookListKernels`         List available Jupyter kernels
+                                                      *:NotebookServerConnect*
+    `:NotebookServerConnect` {url} [kernel]
+                                   Use a kernel on a Jupyter server
+                                   (JupyterLab, JupyterHub, jupyter server).
+                                   [kernel] is a running kernel id to attach
+                                   to or a kernelspec name to start; without
+                                   it you pick from a list. The token comes
+                                   from the URL (?token=) or $JUPYTER_TOKEN.
+                                   Disconnecting only shuts down kernels
+                                   ipynb.nvim started.
 
 Output: ~
 
     `:NotebookOutput`              Open cell output in floating buffer
+    `:NotebookOpenOutput`          Open image/PDF/HTML/Plotly output in the
+                                   system viewer or browser
+    `:NotebookToggleOutputsHidden` Hide/show the cell's outputs
     `:NotebookClearOutput`         Clear current cell output
     `:NotebookClearAllOutputs`     Clear all outputs
 
@@ -530,6 +624,19 @@ Other: ~
                                    Example: :NotebookCreate myfile julia-1.10
     `:NotebookSave`                Save notebook to disk
     `:NotebookInfo`                Show notebook and cell information
+                                                             *:NotebookExport*
+    `:NotebookExport` {format}     Export with nbconvert using the kernel's
+                                   Python: html, pdf, webpdf, markdown,
+                                   script (python), latex, rst, asciidoc,
+                                   slides
+
+More cell operations: ~
+
+    `:NotebookCopyCell`            Copy cell to register
+    `:NotebookMergeCellBelow`      Merge the cell with the one below
+    `:NotebookSplitCell`           Split the cell at the cursor
+    `:NotebookCellTags` [tags...]  Set tags, or edit them in a prompt
+    `:NotebookToggleSourceHidden`  Hide/show the cell's code
 
 ==============================================================================
 TROUBLESHOOTING                                         *ipynb-troubleshooting*
@@ -611,4 +718,40 @@ Example with lualine: >lua
 Disable with `kernel.show_status = false` in setup.
 
 ==============================================================================
-vim:tw=78:ts=8:ft=help:norl:
+JUPYTER COMPATIBILITY                                    *ipynb-compatibility*
+
+Files ~
+    Notebooks are written like nbformat does (sorted keys, one-space indent,
+    multi-line strings split into lists, CRLF kept), so saving an untouched
+    notebook changes nothing and diffs stay small. Markdown attachments,
+    unknown output types and all notebook/cell metadata (Colab, Kaggle,
+    Databricks, widgets) are preserved. Cell IDs follow nbformat 4.5; IDs that
+    don't match its pattern are replaced on load.
+
+Metadata shared with other apps ~
+    Tags                metadata.tags (JupyterLab); shown on the border,
+                        edited with |:NotebookCellTags|
+    Titles              Databricks cell titles and Colab "#@title" lines are
+                        shown on the border
+    Hidden code         metadata.jupyter.source_hidden (JupyterLab) and
+                        Colab forms: the cell is folded
+    Hidden outputs      metadata.jupyter.outputs_hidden plus the classic
+                        metadata.collapsed flag
+    Run timing          metadata.execution with |KernelConfig| record_timing
+
+Running ~
+    Cells queued after a failing cell are aborted, as in Jupyter. Magics and
+    shell commands run in the kernel; for Python language servers they are
+    replaced by placeholders in the shadow file and restored after
+    formatting.
+
+Remote compute ~
+    Any Jupyter server works with |:NotebookServerConnect|. Databricks
+    clusters are reached through Databricks Connect inside a local kernel.
+    Google Colab runtimes can't be driven from outside Colab.
+
+Not supported ~
+    ipywidgets and other JavaScript outputs need a browser (HTML outputs can
+    be opened with |:NotebookOpenOutput|).
+
+ vim:tw=78:ts=8:ft=help:norl:

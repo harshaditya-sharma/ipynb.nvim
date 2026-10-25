@@ -244,6 +244,9 @@ local function run_test_file(test_file)
     NVIM_APPNAME = vim.env.NVIM_APPNAME,
     IPYNB_TEST_SKIP_PARSER_SO = vim.env.IPYNB_TEST_SKIP_PARSER_SO,
     IPYNB_TEST_PYTHON = vim.env.IPYNB_TEST_PYTHON,
+    IPYNB_TEST_KERNELS = vim.env.IPYNB_TEST_KERNELS,
+    JUPYTER_PATH = vim.env.JUPYTER_PATH,
+    R_LIBS = vim.env.R_LIBS,
     -- Windows needs these for Python/Jupyter and temp paths
     SYSTEMROOT = vim.env.SYSTEMROOT,
     TEMP = vim.env.TEMP,
@@ -400,6 +403,7 @@ local tests = {
   join(root, 'tests/test_remote_e2e.lua'),
   join(root, 'tests/test_repl.lua'),
   join(root, 'tests/test_termimage.lua'),
+  join(root, 'tests/test_kernels_multi.lua'),
   join(root, 'tests/test_shadow.lua'),
   join(root, 'tests/test_lsp.lua'),
   join(root, 'tests/test_lsp_go.lua'),

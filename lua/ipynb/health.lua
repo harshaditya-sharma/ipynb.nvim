@@ -79,21 +79,38 @@ local function check_python()
     })
   end
 
-  -- Check for Python
-  local python_path = vim.fn.exepath('python3')
-  if python_path == '' then
-    python_path = vim.fn.exepath('python')
+  -- The same Python the kernel bridge would use for a notebook in the cwd
+  local python_path, source = require('ipynb.kernel').get_python_info(vim.fn.getcwd() .. '/notebook.ipynb')
+  if not python_path then
+    health.warn('Python not found', {
+      'Install Python, or set kernel.python_path in your config',
+    })
+    return
   end
+  health.ok(string.format('Python (%s): %s', source, python_path))
 
-  if python_path ~= '' then
-    health.ok('Python found: ' .. python_path)
+  local function has(modules)
+    local r = vim.system({ python_path, '-c', 'import ' .. modules }, { text = true }):wait(30000)
+    return r.code == 0
+  end
+  if has('jupyter_client, ipykernel') then
+    health.ok('jupyter_client and ipykernel are installed')
   else
-    health.warn('Python not found in PATH', {
-      'Set kernel.python_path in your config to specify Python location',
+    health.warn('jupyter_client / ipykernel missing: kernels cannot start', {
+      python_path .. ' -m pip install jupyter_client ipykernel',
+      'Or create a .venv next to your notebooks with them; it is found automatically',
     })
   end
-
-  health.info('Kernel execution requires jupyter_client (pip install jupyter_client)')
+  if has('jupyter_server') then
+    health.ok('jupyter_server installed (local Jupyter server for :NotebookServerConnect)')
+  else
+    health.info('jupyter_server not installed: only needed to run a Jupyter server yourself; :NotebookServerConnect works with any server')
+  end
+  if has('nbconvert') then
+    health.ok('nbconvert installed (:NotebookExport)')
+  else
+    health.info(':NotebookExport needs nbconvert (' .. python_path .. ' -m pip install nbconvert)')
+  end
 end
 
 ---Check optional dependencies
@@ -128,7 +145,31 @@ local function check_optional()
       health.info('snacks.nvim installed but image module not available')
     end
   else
-    health.info('snacks.nvim not installed (optional, for inline images)')
+    health.info('snacks.nvim not installed (inline images in kitty / Ghostty / WezTerm)')
+  end
+
+  -- Sixel / iTerm2 images (terminals without kitty placeholders)
+  local backend = require('ipynb.termimage').backend()
+  if backend == 'sixel' then
+    if vim.fn.executable('magick') == 1 or vim.fn.executable('convert') == 1 then
+      health.ok('Inline images: Sixel (ImageMagick found)')
+    else
+      health.warn('Inline images use Sixel here but ImageMagick is missing', {
+        vim.fn.has('win32') == 1 and 'winget install ImageMagick.ImageMagick' or 'Install imagemagick with your package manager',
+      })
+    end
+  elseif backend == 'iterm2' then
+    health.ok('Inline images: iTerm2 protocol')
+  else
+    health.info('No Sixel/iTerm2 terminal detected (images.backend = "' .. tostring(
+      require('ipynb.config').get().images.backend) .. '"); images open with :NotebookOpenOutput')
+  end
+
+  -- iron.nvim for languages without a Jupyter kernel
+  if require('ipynb.repl').available() then
+    health.ok('iron.nvim available: cells run in a REPL when no Jupyter kernel is connected')
+  else
+    health.info('iron.nvim not installed (optional: run cells in a REPL when there is no Jupyter kernel)')
   end
 end
 

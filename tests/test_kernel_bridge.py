@@ -25,9 +25,10 @@ class Bridge:
     """Drives kernel_bridge.py the way kernel.lua does. Works on Windows too
     (a reader thread instead of select(), which only supports sockets there)."""
 
-    def __init__(self):
+    def __init__(self, env=None):
         self.proc = subprocess.Popen(
             [sys.executable, BRIDGE_PATH],
+            env={**os.environ, **(env or {})},
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -260,3 +261,16 @@ def test_bad_commands_report_errors_without_crashing(bridge):
     assert bridge.wait(lambda m: m["type"] == "error" and "cell_id" in m["error"], timeout=5)
     bridge.send(action="ping")
     assert bridge.wait(lambda m: m["type"] == "pong", timeout=5)
+
+
+def test_kernel_output_goes_to_log_file_not_bridge_stderr(tmp_path):
+    b = Bridge(env={"IPYNB_KERNEL_LOG_DIR": str(tmp_path)})
+    try:
+        assert b.next()["type"] == "ready"
+        b.send(action="start", kernel_name="python3")
+        started = b.wait(lambda m: m["type"] in ("kernel_started", "error"), timeout=90)
+        assert started["type"] == "kernel_started", started
+        assert started["log_path"] and os.path.dirname(started["log_path"]) == str(tmp_path)
+        assert os.path.exists(started["log_path"])
+    finally:
+        b.close()

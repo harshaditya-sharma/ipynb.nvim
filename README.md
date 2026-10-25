@@ -1,46 +1,68 @@
 # 📘 `ipynb.nvim`
 
-A modal Jupyter notebook editor for Neovim.
+A modal Jupyter notebook editor for Neovim that reads and writes `.ipynb` files
+exactly like Jupyter, so the same notebook works in JupyterLab, Google Colab,
+Databricks, VS Code and here.
 
-> [!IMPORTANT]
-> `ipynb.nvim` is currently in **alpha**. There *will* be bugs!
+> [!NOTE]
+> This is a fork of [ajbucci/ipynb.nvim](https://github.com/ajbucci/ipynb.nvim) that fixes data loss and
+> Windows bugs and adds the notebook features listed below. It is still young: back up notebooks you care about.
 
 <img width="752" height="517" alt="Screenshot From 2026-01-17 01-28-38" src="https://github.com/user-attachments/assets/6784bcce-ab98-4f5a-9383-567e252276bc" />
 
 ## ✨ Features
 
-- Edit `.ipynb` files as actual notebooks with isolated cell buffers
-- Cell outputs render inline as virtual lines (open in float to copy)
-- Inline image rendering (PNG, JPEG, SVG, etc.)
-- Variable inspector with auto-hover (uses Jupyter inspect protocol)
-- Partial language server support (diagnostics, completion, go to definition, rename)
-- Multi-language support (Python, Julia, R, and more)
-- Treesitter highlighting with dynamic language injection
+- **Notebook files, Jupyter-exact**: saving an untouched notebook changes nothing (same key order, indent and
+  line splitting as `nbformat`, CRLF kept); attachments, tags, Colab/Kaggle/Databricks metadata and unknown
+  output types are preserved; saved files pass `nbformat.validate`
+- **Cells**: code / markdown / raw; add, cut, copy, paste, move, merge, split; undo across cells; tags and
+  titles (Databricks titles, Colab `#@title`) on the cell border; hide code / hide outputs saved like JupyterLab
+- **Editing**: each cell in its own buffer with your keymaps and LSP, either *overlaid on the cell* or in a
+  **split next to the notebook** so earlier cells and outputs stay in view while you type
+- **Running**: run cell / and next / and insert, run all, above, below, selection; restart and run all;
+  interrupt; `input()` prompts; queued vs running state and run time per cell; stops after an error like Jupyter
+- **Any Jupyter kernel**: Python, R, Julia, Go, Rust, … on this machine, **on a Jupyter server** (JupyterLab,
+  JupyterHub, `jupyter server`), or via a connection file; cells run in an [iron.nvim](https://github.com/Vigemus/iron.nvim)
+  REPL when a language has no kernel
+- **Outputs**: streams with progress bars, coloured tracebacks (ANSI), `clear_output` and display updates,
+  readable HTML/Markdown/LaTeX/JSON fallbacks (tables become aligned text), long outputs truncated with a note
+- **Images**: inline via kitty (snacks.nvim), **Sixel** (Windows Terminal, foot, …) or **iTerm2** (iTerm2,
+  WezTerm); anything else (PDF, HTML, Plotly) opens in your viewer/browser
+- **LSP across cells**: diagnostics, completion, hover, definition, references, rename, formatting; IPython
+  syntax (`%magic`, `!cmd`, `%%bash`) is hidden from Python servers and restored after formatting
+- **More**: variable inspector, cell picker, folding, `:NotebookExport` (nbconvert), `:checkhealth ipynb`
 
 ## 🧩 How It Works
 
-The plugin uses a modal editing approach:
+- **Notebook mode**: the notebook is rendered into one read-only buffer for navigating and managing cells
+- **Cell mode**: `i`/`a`/`o`/`<CR>` edit the current cell in its own buffer (overlay or split); edits sync back
 
-- **Notebook mode**: for navigating and managing cells
-- **Cell mode**: for editing cell content in an isolated buffer
-
-Under the hood, the notebook is rendered into a single buffer for display. Entering Cell mode opens an isolated buffer for just the active cell, and edits sync back to the notebook buffer. In parallel, all code cells are mirrored into a shared “shadow” buffer that LSP requests are proxied through. This design aims to preserve the feel of Jupyter notebooks.
+All code cells are also mirrored into a hidden "shadow" file that language servers attach to, line-for-line with
+the notebook, so LSP requests from either view are proxied there. A small Python process (`python/kernel_bridge.py`)
+talks to Jupyter kernels with `jupyter_client` on one asyncio loop.
 
 ## ⚡️ Requirements
 
-- Neovim 0.10+
-- [nvim-treesitter](https://github.com/nvim-treesitter/nvim-treesitter)
-- Python 3.x with `jupyter_client` (for kernel execution)
+- Neovim 0.10+ (0.12+ for Sixel/iTerm2 images)
+- [nvim-treesitter](https://github.com/nvim-treesitter/nvim-treesitter) (the notebook parser compiles on first load)
+- Python 3.9+ with `jupyter_client` and `ipykernel` for running code:
 
-***Optional (but highly recommended):***
+  ```sh
+  python -m pip install jupyter_client ipykernel
+  ```
 
-- [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) for LSP support (completion, diagnostics, etc.)
+  A `.venv` / `venv` next to (or above) the notebook is found automatically.
+
+***Optional:***
+
+- [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) or `vim.lsp.config` servers for LSP features
 - [nvim-web-devicons](https://github.com/nvim-tree/nvim-web-devicons) for language icons in cell borders
-- [snacks.nvim](https://github.com/folke/snacks.nvim) for inline image rendering
-  - a terminal that fully supports the kitty graphics protocol (e.g., kitty, Ghostty)
-  - ImageMagick required to display non-PNG image formats
+- [snacks.nvim](https://github.com/folke/snacks.nvim) for inline images in kitty / Ghostty / WezTerm
+- ImageMagick (`magick`) for Sixel images (Windows Terminal: `winget install ImageMagick.ImageMagick`)
+- [iron.nvim](https://github.com/Vigemus/iron.nvim) to run cells in a REPL when there is no Jupyter kernel
+- `nbconvert` for `:NotebookExport`, `jupyter_server` if you want to run a Jupyter server yourself
 
-Run `:checkhealth ipynb` to verify your setup.
+Run `:checkhealth ipynb` to see what is set up (it checks the same Python the kernel will use).
 
 ## 📦 Installation
 
@@ -48,18 +70,17 @@ Run `:checkhealth ipynb` to verify your setup.
 
 ```lua
 {
-  "ajbucci/ipynb.nvim",
+  "ajbucci/ipynb.nvim", -- or your fork
   dependencies = {
     "nvim-treesitter/nvim-treesitter",
     "neovim/nvim-lspconfig",
-    -- "nvim-tree/nvim-web-devicons", -- optional, for language icons
-    -- "folke/snacks.nvim", -- optional, for inline images
+    -- "nvim-tree/nvim-web-devicons", -- optional, language icons
+    -- "folke/snacks.nvim",           -- optional, kitty-protocol images
   },
+  lazy = false, -- must own *.ipynb before the first notebook is read
   opts = {},
 }
 ```
-
-The treesitter parser is automatically compiled on first load.
 
 ### Manual
 
@@ -68,261 +89,244 @@ The treesitter parser is automatically compiled on first load.
 
 ## 🚀 Usage
 
-### 1. Open a notebook
+1. **Open** a notebook: `nvim notebook.ipynb`, `:e notebook.ipynb`, or `:NotebookCreate name [kernel]`
+2. **Edit** a cell: put the cursor on it (`]]` / `[[` jump between cells) and press `i`, `a`, `o` or `<CR>`;
+   `<Esc>` returns to Notebook mode. `<C-j>` / `<C-k>` edit the next / previous cell.
+3. **Start a kernel**: `:NotebookKernelStart` (`<leader>ks`), or `:NotebookServerConnect <url>` for a
+   Jupyter server
+4. **Run**: `<C-CR>` (stay), `<S-CR>` (next), `<M-CR>` (insert below); in the cell editor, select lines and
+   press `<C-CR>` to run just those
+5. **Outputs** show under the cell; `:NotebookOutput` (`<leader>ko`) opens them in a float to copy,
+   `:NotebookOpenOutput` opens images / HTML / plots in your viewer
+6. **Inspect** variables with `:NotebookInspect` (`<leader>kh`) or `:NotebookInspectCell` (`<leader>kv`)
 
-  ```sh
-  nvim notebook.ipynb
-  ```
+### Split editor
 
-  ```vim
-  " or from in neovim:
-  :e notebook.ipynb
-  " or
-  :NotebookCreate notebook.ipynb 
-  ```
+```lua
+opts = { float = { layout = "split", split = { position = "right", size = 0.45 } } }
+```
 
-### 2. Edit a cell
+The cell opens in a split beside the notebook. Scroll the notebook side freely while editing (it is read-only
+while focused), and pressing `i` on another cell reuses the same split.
 
-- Place your cursor anywhere on a cell (you can quickly navigate using `]]` (next) and `[[` (previous), though any vim motions will work)
-- Press `i` (Insert) or `<CR>` (Normal) to enter Cell mode for the current cell
-- Press `<Esc>` to exit Cell mode and return to Notebook mode
+## 🧪 Compatibility with other notebook apps
 
-### 3. Start a kernel
+| | JupyterLab | Colab | Databricks | ipynb.nvim |
+|---|---|---|---|---|
+| Open/save without changing the file | ✓ | ✓ | ✓ | ✓ byte-identical, CRLF kept |
+| Markdown attachments (pasted images) | ✓ | ✓ | ✓ | kept on save |
+| Cell tags / titles | tags | `#@title` | titles | shown on the cell border; tags editable |
+| Hide code / hide outputs | ✓ | forms | ✓ | ✓ same metadata (`jupyter.source_hidden` / `outputs_hidden`) |
+| Run all / above / below / selection, restart & run all | ✓ | ✓ | ✓ | ✓ |
+| Stop after an error | ✓ | ✓ | ✓ | ✓ (queued cells are aborted) |
+| Run time per cell | ✓ | ✓ | ✓ | ✓ (optionally saved like JupyterLab: `kernel.record_timing`) |
+| `clear_output`, display updates, progress bars | ✓ | ✓ | ✓ | ✓ |
+| Magics / shell (`%time`, `!pip`, `%%bash`) | ✓ | ✓ | `%sql` etc. | run by the kernel; hidden from Python LSPs |
+| Remote compute | server | Colab VMs | clusters | any Jupyter server; Databricks via [Databricks Connect](https://docs.databricks.com/dev-tools/databricks-connect/index.html) in a local kernel |
+| Widgets (ipywidgets) | ✓ | ✓ | ✓ | not in a terminal |
 
-- Start a Jupyter kernel with `:NotebookKernelStart` (default keymap: `<leader>ks`)
-
-### 4. Execute a cell
-
-- Execute a cell with `:NotebookExecuteCell` (default keymap: `<leader>kx`)
-
-### 5. View outputs
-
-- Outputs render inline as virtual lines below the cell
-- Use `:NotebookOutput` (default keymap: `<leader>ko`) to open the output in a floating window for easy copying
-
-### 6. Inspect variables
-
-- Place your cursor on a variable and inspect it using `:NotebookInspect` (default keymap: `<leader>kh`)
-- Inspect all variables in cell using `:NotebookInspectCell` (default keymap: `<leader>kv`)
+Colab runtimes can't be driven from outside Colab, so Colab notebooks are opened, edited and saved here and run
+on a local or Jupyter-server kernel.
 
 ## 📝 Persistent Markdown Rendering
 
-Markdown cells receive Tree-sitter highlighting out of the box. To render
-headings, links, lists, tables, and LaTeX persistently in Notebook mode, use a
-Markdown renderer that supports injected Tree-sitter languages and configure it
-to attach to the `ipynb` filetype.
-
-For [render-markdown.nvim](https://github.com/MeanderingProgrammer/render-markdown.nvim)
-with lazy.nvim:
+Markdown cells receive Tree-sitter highlighting out of the box. To render headings, links, lists, tables, and
+LaTeX persistently in Notebook mode, use a Markdown renderer that supports injected Tree-sitter languages and
+attach it to the `ipynb` filetype. For
+[render-markdown.nvim](https://github.com/MeanderingProgrammer/render-markdown.nvim):
 
 ```lua
 {
   "MeanderingProgrammer/render-markdown.nvim",
   ft = { "markdown", "ipynb" },
   opts = {
+    file_types = { "markdown", "ipynb" },
     overrides = {
       filetype = {
-        ipynb = {
-          -- Optional: keep the cursor line rendered in the notebook facade.
-          anti_conceal = { enabled = false },
-        },
+        -- Optional: keep the cursor line rendered in the notebook facade.
+        ipynb = { anti_conceal = { enabled = false } },
       },
     },
   },
 }
 ```
 
-If your plugin manager does not provide filetype configuration to
-render-markdown.nvim, set its attachment list explicitly:
-
-```lua
-require("render-markdown").setup({
-  file_types = { "markdown", "ipynb" },
-})
-```
-
-If a distribution already configures render-markdown.nvim, extend its existing
-plugin specification instead of calling `setup()` a second time. LaTeX
-rendering also requires render-markdown.nvim's optional LaTeX dependencies.
-
-For [markview.nvim](https://github.com/OXY2DEV/markview.nvim), add `ipynb` to
-`preview.filetypes` while retaining its defaults.
-
-The notebook buffer must remain `filetype=ipynb`. Changing it to `markdown` or
-`ipynb.markdown` disables the parser that identifies cell boundaries and
-provides the Markdown injections.
+For [markview.nvim](https://github.com/OXY2DEV/markview.nvim), add `ipynb` to `preview.filetypes`. The notebook
+buffer must remain `filetype=ipynb`.
 
 ## 🐍 Python Environment *(for Jupyter kernels)*
 
-When starting a kernel, the plugin looks for Python in this order:
+The kernel bridge runs with the first Python found from:
 
 1. **Path argument** passed to `:NotebookKernelStart`
 2. **`kernel.python_path`** in config
-3. **Virtual environment** found by walking up from the notebook's directory, checking for `.venv`, `venv`, `.virtualenv`, or `env`
-4. **System Python** (`python3` or `python` in PATH)
+3. **Virtual environment** found by walking up from the notebook's directory (`.venv`, `venv`, `.virtualenv`,
+   `env`; `Scripts\python.exe` on Windows, `bin/python` elsewhere)
+4. **System Python** (`python3`, then `python`; on Windows `python` first, and the Microsoft Store
+   `python3` stub is skipped)
+
+That Python needs `jupyter_client`; the kernel itself is whatever the notebook's kernelspec names
+(`:NotebookListKernels`, `:NotebookSetKernel`).
+
+## 🗂️ Other languages
+
+The language comes from the notebook metadata (and from the kernel once it starts) and drives highlighting, the
+shadow file's language server, and execution. Install the Jupyter kernel for the language
+(IRkernel, IJulia, gonb, evcxr, …) and its language server.
 
 ```vim
-" Use a specific Python for this session
-:NotebookKernelStart /path/to/venv/bin/python
-
-" Or configure a default in setup
+:NotebookCreate analysis ir
+:NotebookSetKernel julia-1.10
 ```
 
-```lua
-require("ipynb").setup({
-  kernel = {
-    python_path = "/path/to/your/venv/bin/python",
-  },
-})
-```
-
-## 🗂️ Multi-Language Support
+**No kernel for the language?** With [iron.nvim](https://github.com/Vigemus/iron.nvim) installed, running a cell
+with no kernel connected sends it to iron's REPL for the notebook language (`repl.fallback = true`); output
+shows in the REPL window. `:NotebookReplSend` sends a cell explicitly.
 
 > [!WARNING]
 > `R.nvim` is unsupported! Please disable it when using this plugin.
 
-The plugin reads the language from notebook metadata and automatically configures:
-
-- **Syntax highlighting** via tree-sitter language injection
-- **LSP** by setting the shadow buffer's filetype (triggers your LSP config)
-- **Kernel execution** via `jupyter_client` (supports any installed Jupyter kernel)
-- **Blocking `input()` support** via floating prompt UI (`getpass` uses secure masked fallback)
-
-The default language when creating a new notebook is Python. You can specify a kernel when creating:
+## 🌐 Jupyter servers
 
 ```vim
-:NotebookCreate mynotebook julia-1.10
-:NotebookCreate analysis ir          " R kernel
+:NotebookServerConnect http://localhost:8888/lab?token=abc          " pick a running kernel or start one
+:NotebookServerConnect https://hub.example.com/user/me/?token=abc python3
 ```
 
-Or change an existing notebook's kernel with `:NotebookSetKernel`:
+Paste the URL from JupyterLab or JupyterHub (frontend paths like `/lab` are ignored). The token can also come
+from `$JUPYTER_TOKEN`, which keeps it out of your command history. Interrupt and restart go through the server;
+disconnecting only shuts down kernels ipynb.nvim started.
 
-```vim
-:NotebookSetKernel julia-1.12
-:NotebookSetKernel ir           " R kernel
-:NotebookSetKernel python3
-```
+## 🖼️ Images
 
-This updates the notebook metadata and re-attaches the appropriate LSP.
+| Terminal | Protocol | Needs |
+|---|---|---|
+| kitty, Ghostty | kitty placeholders | snacks.nvim |
+| WezTerm, iTerm2 | iTerm2 (OSC 1337) | Neovim 0.12+ |
+| Windows Terminal 1.22+, foot, mlterm | Sixel | Neovim 0.12+, ImageMagick |
+| anything else | — | `:NotebookOpenOutput` opens it in your viewer |
 
-**Requirements per language:**
-
-- Install the Jupyter kernel (e.g., `IJulia` for Julia, `IRkernel` for R)
-- Install an LSP server (e.g., `julials`, `r_language_server`)
-- Configure the LSP in your Neovim setup
+`images.backend = "auto"` picks one from the terminal; set `"sixel"`, `"iterm2"`, `"kitty"` or `"none"` to choose.
+Sixel/iTerm2 images are drawn only when they fit in the window and redrawn as you scroll.
 
 ## ⚙️ Configuration
-
-`ipynb.nvim` is highly configurable. Expand to see the default configuration below.
 
 <details><summary>Default Options</summary>
 
 <!-- config:start -->
 ```lua
 require("ipynb").setup({
+  float = {
+    layout = "overlay", -- "overlay" = edit on top of the cell, "split" = edit in a split beside the notebook
+    split = { position = "right", size = 0.45 }, -- used when layout = "split"
+    show_line_numbers = false, -- line numbers in overlay mode (facade numbers visible behind)
+  },
   keymaps = {
-    -- Navigation (Notebook mode)
-    next_cell = "]]",              -- jump to next cell
-    prev_cell = "[[",              -- jump to previous cell
-    -- Navigation (both Notebook mode and Cell mode)
-    jump_to_cell = "<leader>kj",   -- open cell picker
-    -- Cell operations (Notebook mode)
-    cut_cell = "dd",               -- cut cell to register
-    paste_cell_below = "p",        -- paste cell below
-    paste_cell_above = "P",        -- paste cell above
-    move_cell_down = "<M-j>",      -- move cell down
-    move_cell_up = "<M-k>",        -- move cell up
-    -- Cell operations (both Notebook mode and Cell mode)
-    add_cell_above = "<leader>ka", -- insert cell above
-    add_cell_below = "<leader>kb", -- insert cell below
-    make_markdown = "<leader>km",  -- convert to markdown cell
-    make_code = "<leader>ky",      -- convert to code cell
-    make_raw = "<leader>kr",       -- convert to raw cell
-    fold_toggle = "<leader>kf",    -- toggle cell fold
-    -- Execution (both Notebook mode and Cell mode)
-    execute_cell = "<C-CR>",            -- execute cell, stay
-    execute_and_next = "<S-CR>",        -- execute cell, move to next
-    execute_and_insert = "<M-CR>",      -- execute cell, insert new below
-    execute_all_below = nil,            -- execute current and all below (unmapped)
-    menu_execute_cell = "<leader>kx",   -- execute cell (menu, if <C-CR> conflicts)
-    menu_execute_and_next = "<leader>kX", -- execute and next (menu, if <S-CR> conflicts)
-    -- Output (both Notebook mode and Cell mode)
-    open_output = "<leader>ko",      -- open cell output in float (for copying)
-    clear_output = "<leader>kc",     -- clear current cell output
-    clear_all_outputs = "<leader>kC", -- clear all outputs
-    -- Kernel (both Notebook mode and Cell mode)
-    interrupt_kernel = "<C-c>",      -- interrupt execution
-    kernel_interrupt = "<leader>ki", -- interrupt (menu)
-    kernel_restart = "<leader>k0",   -- restart kernel
-    kernel_start = "<leader>ks",     -- start kernel
-    kernel_shutdown = "<leader>kS",  -- shutdown kernel
-    kernel_info = "<leader>kn",      -- show kernel info
-    -- Inspector (both Notebook mode and Cell mode)
-    variable_inspect = "<leader>kh", -- inspect variable at cursor
-    cell_variables = "<leader>kv",   -- show all variables in cell
-    toggle_auto_hover = "<leader>kH", -- toggle auto-hover on CursorHold
-    -- Note: i, a, I, A, o, O, <CR> enter Cell mode; <Esc> exits Cell mode
-    -- Note: u, <C-r> perform global undo/redo across cells in both Notebook mode and Cell mode
-    -- Note: <C-j>/<C-k> navigate cells while in Cell mode
-    -- Note: LSP commands (go to definition, references, hover, etc.) are proxied
+    -- Direct facade keys (high-frequency)
+    next_cell = "]]",
+    prev_cell = "[[",
+    jump_to_cell = "<leader>kj",
+    cut_cell = "dd",
+    paste_cell_below = "p",
+    paste_cell_above = "P",
+    move_cell_down = "<M-j>",
+    move_cell_up = "<M-k>",
+    execute_cell = "<C-CR>",
+    execute_and_next = "<S-CR>",
+    execute_and_insert = "<M-CR>",
+    interrupt_kernel = "<C-c>",
+    -- <leader>k menu (notebook operations)
+    add_cell_above = "<leader>ka",
+    add_cell_below = "<leader>kb",
+    make_markdown = "<leader>km",
+    make_code = "<leader>ky",
+    make_raw = "<leader>kr",
+    open_output = "<leader>ko",
+    clear_output = "<leader>kc",
+    clear_all_outputs = "<leader>kC",
+    menu_execute_cell = "<leader>kx",
+    menu_execute_and_next = "<leader>kX",
+    execute_all_below = nil, -- Unmapped by default; set to e.g. '<leader>kA' to enable
+    execute_all_above = nil, -- Run all cells above the current one (unmapped)
+    execute_all = nil, -- Run all cells (unmapped)
+    restart_and_run_all = nil, -- Restart kernel, then run all cells (unmapped)
+    copy_cell = "yy", -- Copy cell to the cell register
+    merge_cell_below = nil, -- Merge current cell with the one below (unmapped)
+    split_cell = nil, -- Split the edited cell at the cursor (cell editor, unmapped)
+    toggle_source_hidden = nil, -- Hide/show the cell's code, saved like JupyterLab (unmapped)
+    toggle_outputs_hidden = nil, -- Hide/show the cell's outputs, saved like JupyterLab (unmapped)
+    open_output_external = nil, -- Open image/HTML output in the system viewer (unmapped)
+    edit_tags = nil, -- Edit the cell's tags (unmapped)
+    repl_send_cell = nil, -- Send cell (or selection in the cell editor) to the iron.nvim REPL (unmapped)
+    kernel_interrupt = "<leader>ki",
+    kernel_restart = "<leader>k0",
+    kernel_start = "<leader>ks",
+    kernel_shutdown = "<leader>kS",
+    kernel_info = "<leader>kn",
+    fold_toggle = "<leader>kf",
+    variable_inspect = "<leader>kh",
+    cell_variables = "<leader>kv",
+    toggle_auto_hover = "<leader>kH",
+    -- Note: i, a, I, A, o, O, <CR> are hardcoded for edit mode entry
+    -- Note: LSP keymaps (gd, gr, K, etc.) work via API interception in lsp.lua
   },
-  -- Highlight groups for various notebook elements
   highlights = {
-    -- For notebook
-    border = "Comment",           -- Cell border
-    border_hover = "Special",     -- Cell border when cursor on cell
-    border_active = "Number",     -- Cell border when in Cell mode
-    exec_count = "Number",        -- Execution count [N]
-    output = "Comment",           -- Output text
-    hint = "Comment",             -- Cell action keymap hints
-    -- For statusline
+    border = "Comment",
+    border_hover = "Special",
+    border_active = "Number",
+    exec_count = "Number",
+    output = "Comment",
     output_error = "DiagnosticError",
-    executing = "DiagnosticWarn", -- Executing indicator
-    queued = "DiagnosticHint",    -- Queued indicator
+    output_stderr = "DiagnosticWarn",
+    executing = "DiagnosticWarn",
+    queued = "DiagnosticHint",
+    hint = "Comment",
   },
-  -- Cell border action keymap hints
   border_hints = {
-    enabled = true,        -- Show action hints on active cell border
-    show_on_hover = true,  -- Show hints in Notebook mode
-    show_on_edit = true,   -- Show hints in Cell mode
+    enabled = true,
+    show_on_hover = true,
+    show_on_edit = true,
+  },
+  repl = {
+    fallback = true, -- with no Jupyter kernel, run cells in an iron.nvim REPL (if installed)
+  },
+  output = {
+    max_lines = 100, -- inline text lines per cell; the rest via open_output (0 = no limit)
   },
   kernel = {
-    auto_connect = false,  -- Auto-connect to kernel on notebook open
-    show_status = true,    -- Show kernel status in statusline
-    python_path = nil,     -- Custom Python path (otherwise auto-discovered)
+    auto_connect = false,
+    show_status = true,
+    python_path = nil, -- Custom Python path (otherwise auto-discovered)
+    record_timing = false, -- Save cell start/end times in metadata (JupyterLab format)
   },
   images = {
     enabled = true,
+    backend = "auto", -- "auto", "kitty" (snacks.nvim), "sixel", "iterm2" or "none"
+    cell_size = { 10, 20 }, -- terminal cell size in pixels, used to size Sixel images
+    max_rows = 20, -- tallest inline image (Sixel / iTerm2), in rows
     cache_dir = vim.fn.stdpath("cache") .. "/ipynb.nvim",
-    max_width = nil,   -- nil = window width minus sign/number columns
-    max_height = nil,  -- nil = window height minus scrolloff minus 1
+    max_width = nil, -- nil = window width minus sign/number columns
+    max_height = nil, -- nil = window height minus scrolloff minus 1
   },
   inspector = {
-    -- Keymaps while in cell variable inspector float window
-    close = { "q", "<Esc>" },   -- Keys to close inspector window
-    inspect = { "K", "<CR>" },  -- Keys to inspect variable under cursor
-    -- Auto-hover inspect configuration
+    close = { "q", "<Esc>" }, -- Keys to close inspector window
+    inspect = { "K", "<CR>" }, -- Keys to inspect variable under cursor
     auto_hover = {
-      enabled = false,  -- Auto-show variable hover on CursorHold
-      delay = 500,     -- Milliseconds before showing hover
+      enabled = false, -- Auto-show variable hover on CursorHold
+      delay = 500, -- Delay in milliseconds before showing hover
     },
   },
-  -- Cell folding configuration
   folding = {
-    hide_output = false,  -- Hide output when folded (includes cell end marker in fold)
+    hide_output = false, -- Include end marker in fold to hide output when folded
   },
-  -- LSP formatting configuration -- vim.lsp.buf.format() integration
   format = {
-    enabled = true,  -- Wrap vim.lsp.buf.format() to work with notebooks
-    -- Each cell is formatted as an individual document
-    -- with some formatters adding trailing blank lines.
-    -- This option control how many blank lines to keep:
-    trailing_blank_lines = 0,  -- # trailing blank lines to keep per cell when formatted
+    enabled = true, -- Wrap vim.lsp.buf.format() to work with notebooks
+    trailing_blank_lines = 0, -- Max trailing blank lines to keep after formatting
   },
-  -- Shadow buffer location (use "workspace" if LSP needs project/module layout)
   shadow = {
-    location = "temp",   -- "temp" (default) or "workspace"
-    dir = ".ipynb.nvim", -- subdir used when location = "workspace" (opt-in)
+    location = "temp", -- "temp" (default) or "workspace"
+    dir = ".ipynb.nvim",
+    debounce_ms = 400,
   },
 })
 ```
@@ -332,7 +336,7 @@ require("ipynb").setup({
 
 ## ⌨️ Commands
 
-| Command | Description | Config | Default Keymap |
+| Command | Description | Config key | Default keymap |
 |---------|-------------|--------|---------|
 | `:NotebookCreate [path] [kernel]` | Create new notebook | | |
 | `:NotebookSave` | Save notebook | | |
@@ -342,19 +346,29 @@ require("ipynb").setup({
 | `:NotebookInsertCellAbove` | Insert cell above | `add_cell_above` | `<leader>ka` |
 | `:NotebookDeleteCell` | Delete current cell | | |
 | `:NotebookCutCell` | Cut cell to register | `cut_cell` | `dd` |
+| `:NotebookCopyCell` | Copy cell to register | `copy_cell` | `yy` |
 | `:NotebookPasteCellBelow` | Paste cell below | `paste_cell_below` | `p` |
 | `:NotebookPasteCellAbove` | Paste cell above | `paste_cell_above` | `P` |
 | `:NotebookMoveCellUp` | Move cell up | `move_cell_up` | `<M-k>` |
 | `:NotebookMoveCellDown` | Move cell down | `move_cell_down` | `<M-j>` |
+| `:NotebookMergeCellBelow` | Merge with the cell below | `merge_cell_below` | |
+| `:NotebookSplitCell` | Split cell at cursor | `split_cell` (cell editor) | |
 | `:NotebookToggleCellType` | Toggle code/markdown | | |
 | `:NotebookMakeMarkdown` | Convert to markdown | `make_markdown` | `<leader>km` |
 | `:NotebookMakeCode` | Convert to code | `make_code` | `<leader>ky` |
 | `:NotebookMakeRaw` | Convert to raw | `make_raw` | `<leader>kr` |
+| `:NotebookCellTags [tags…]` | Set / edit cell tags | `edit_tags` | |
+| `:NotebookToggleSourceHidden` | Hide/show cell code | `toggle_source_hidden` | |
+| `:NotebookToggleOutputsHidden` | Hide/show cell outputs | `toggle_outputs_hidden` | |
 | `:NotebookExecuteCell` | Execute cell, stay | `execute_cell` | `<C-CR>` |
 | `:NotebookExecuteAndNext` | Execute cell, move next | `execute_and_next` | `<S-CR>` |
-| `:NotebookExecuteAllBelow` | Execute current and below | `execute_all_below` | (unmapped) |
-| `:NotebookExecuteAll` | Execute all code cells | | |
+| `:NotebookExecuteAllAbove` | Execute cells above | `execute_all_above` | |
+| `:NotebookExecuteAllBelow` | Execute current and below | `execute_all_below` | |
+| `:NotebookExecuteAll` | Execute all code cells | `execute_all` | |
+| `:NotebookRestartAndRunAll` | Restart kernel, run all | `restart_and_run_all` | |
+| `:NotebookReplSend` | Send cell to the iron.nvim REPL | `repl_send_cell` | |
 | `:NotebookOutput` | Open output in float | `open_output` | `<leader>ko` |
+| `:NotebookOpenOutput` | Open image/HTML/plot externally | `open_output_external` | |
 | `:NotebookClearOutput` | Clear cell output | `clear_output` | `<leader>kc` |
 | `:NotebookClearAllOutputs` | Clear all outputs | `clear_all_outputs` | `<leader>kC` |
 | `:NotebookFoldCell` | Toggle cell fold | `fold_toggle` | `<leader>kf` |
@@ -362,8 +376,10 @@ require("ipynb").setup({
 | `:NotebookUnfoldAll` | Unfold all cells | | |
 | `:NotebookFormatCell` | Format cell via LSP | | |
 | `:NotebookFormatAll` | Format all code cells | | |
-| `:NotebookKernelStart [path]` | Start kernel | `kernel_start` | `<leader>ks` |
-| `:NotebookKernelConnect <file>` | Connect to kernel | | |
+| `:NotebookExport {format}` | Export with nbconvert (html, pdf, script, markdown, …) | | |
+| `:NotebookKernelStart [python]` | Start kernel | `kernel_start` | `<leader>ks` |
+| `:NotebookKernelConnect <file>` | Connect to kernel connection file | | |
+| `:NotebookServerConnect <url> [kernel]` | Use a kernel on a Jupyter server | | |
 | `:NotebookSetKernel <name>` | Set kernelspec | | |
 | `:NotebookListKernels` | List available Jupyter kernels | | |
 | `:NotebookKernelInterrupt` | Interrupt execution | `interrupt_kernel` | `<C-c>` |
@@ -374,15 +390,16 @@ require("ipynb").setup({
 | `:NotebookInspectCell` | Show all cell variables | `cell_variables` | `<leader>kv` |
 | `:NotebookToggleAutoHover` | Toggle auto-hover | `toggle_auto_hover` | `<leader>kH` |
 
-Note: `vim.lsp.buf.format()` is wrapped to work with notebooks automatically.
-Disable with `format.enabled = false`.
+In the cell editor: `<Esc>` back to the notebook, `<C-j>`/`<C-k>` next/previous cell, `u`/`<C-r>` notebook-wide
+undo, and `<C-CR>` on a visual selection runs just the selection.
+
+Note: `vim.lsp.buf.format()` is wrapped to work with notebooks automatically. Disable with `format.enabled = false`.
 
 ## 🚥 Statusline
 
 The plugin provides a statusline component showing kernel status. Add it to your statusline (e.g., lualine):
 
 ```lua
--- lualine example
 require("lualine").setup({
   sections = {
     lualine_x = {
@@ -396,88 +413,54 @@ require("lualine").setup({
 })
 ```
 
-Shows language icon (from nvim-web-devicons) + status with theme-aware colors:
-
-- `IDLE` (green, from `DiagnosticOk`)
-- `BUSY` (yellow, from `DiagnosticWarn`)
-- `DISC` (red, from `DiagnosticError`)
-
-Disable with `kernel.show_status = false` in setup.
+Shows the language icon + `IDLE` (green), `BUSY` (yellow) or `DISC` (red). Disable with
+`kernel.show_status = false`.
 
 ## 🩺 Troubleshooting
 
-**Health check**
+**Start with** `:checkhealth ipynb`.
 
-Run `:checkhealth ipynb` to verify all dependencies are properly configured.
+**Parser not found** — it compiles on first load. If that was interrupted, tree-sitter may report a stale lock
+file under `~/AppData/Local/tree-sitter/lock` (Windows) / `~/.cache/tree-sitter/lock`; remove it and restart,
+or run `:TSInstall! ipynb`.
 
-**Parser not found**
+**Kernel won't start** — `:NotebookKernelStatus` shows the Python used; it needs `jupyter_client` and the
+kernel (`ipykernel` for Python). On Windows make sure it isn't the Microsoft Store `python3` stub (it is skipped
+automatically; set `kernel.python_path` if you use a different interpreter).
 
-The parser should auto-compile on first load. If it fails:
+**Imports unresolved in diagnostics but code runs** — the language server and the kernel can use different
+Pythons. Point your Python LSP at the kernel's interpreter, and consider `shadow.location = "workspace"` so the
+server sees your project layout.
 
-- Ensure nvim-treesitter is installed
-- Run `:TSInstall! ipynb` to manually compile
+**`input()` appears stuck** — the kernel waits for stdin: type in the floating prompt and press `<CR>`
+(`<Esc>`/`<C-c>` cancels by interrupting the kernel).
 
-**No LSP**
+**Images don't show** — check the table in [Images](#️-images). Windows Terminal needs 1.22+ and ImageMagick;
+inside tmux, kitty images need `allow-passthrough on`. If an image is the wrong size with Sixel, set
+`images.cell_size` to your font's cell size in pixels. `:NotebookOpenOutput` always works.
 
-Ensure you have a language server installed for the notebook's language.
-Check `:LspInfo` while in the notebook to see attached clients.
+**`<C-CR>` / `<S-CR>` do nothing** — your terminal may not send them distinctly; use `<leader>kx` /
+`<leader>kX`, or remap `execute_cell` / `execute_and_next`.
 
-**Python imports unresolved in diagnostics, but code executes**
+## 🧪 Development
 
-If you see diagnostics like `Import "numpy" could not be resolved` while notebook execution works:
+```sh
+nvim --headless -l tests/run_all.lua
+```
 
-- LSP and Jupyter kernel are separate processes and may use different Python environments
-- Check kernel Python: run `import sys; print(sys.executable)` in a cell
-- Configure your Python LSP (`pyright`/`basedpyright`) to use the same interpreter (for example, project `.venv`)
-- For notebooks, consider `shadow.location = "workspace"` so LSP runs with project context instead of temp paths
-
-**Kernel won't start**
-
-Check `:NotebookKernelStatus` for the Python path being used.
-Ensure `jupyter_client` is installed: `pip install jupyter_client`
-For non-Python kernels, ensure the kernel is installed (e.g., IJulia, IRkernel).
-
-**`input()` appears stuck**
-
-The kernel is waiting for stdin. Enter text in the floating prompt and press `<CR>`.
-Press `<Esc>` / `<C-c>` to cancel (the plugin interrupts the kernel).
-
-**Images not showing**
-
-Requires snacks.nvim and a terminal which fully supports the kitty graphics protocol (kitty, Ghostty). For tmux, set `allow-passthrough=on`.
-
-**`[Image failed to load]` even when terminal support is true**
-
-If `:lua print(require("snacks").image.supports_terminal())` returns `true` but images still fail:
-
-- Run `:checkhealth snacks` (not just `:checkhealth ipynb`)
-- Ensure ImageMagick tools are installed (`magick`/`convert`) for non-PNG conversion
+Set `IPYNB_TEST_PYTHON` to a Python with `jupyter_client`, `ipykernel` and `pytest` (and optionally
+`jupyter_server`, `nbconvert`) to include the real-kernel, Jupyter-server and Python bridge tests;
+`IPYNB_TEST_KERNELS=ir,gonb` adds other languages (`tests/test_kernels_multi.lua`). `IPYNB_TEST_LAYOUT=split`
+runs any suite with the split editor. See `CONTRIBUTING.md` and `doc/ARCHITECTURE.md`.
 
 ## 🗺️ Roadmap
 
-✅ **Working:**
-
-- [x] Read/write .ipynb files
-- [x] Cell navigation and editing
-- [x] Kernel execution and output capture
-- [x] Blocking stdin input prompts (`input()` / `getpass`)
-- [x] Inline image rendering
-- [x] Variable inspector (Jupyter inspect protocol, auto-hover)
-- [x] Partial LSP support (diagnostics, completion, hover, definition, references, rename, formatting, document symbols, signature help, document highlight, inlay hints)
-- [x] Multi-language support (Python, Julia, R, etc.)
-- [x] Cell folding
-- [x] Cell formatting via LSP (`:NotebookFormatCell`, `:NotebookFormatAll`, or `vim.lsp.buf.format()`)
-- [x] Health check (`:checkhealth ipynb`)
-- [x] Code lens (`textDocument/codeLens`) — server/project dependent (may require `shadow.location = "workspace"`)
-- [x] Call hierarchy (`callHierarchy/*`) — requires symbols in a project/module (may require `shadow.location = "workspace"`)
-- [x] Type hierarchy (`typeHierarchy/*`) — requires symbols in a project/module (may require `shadow.location = "workspace"`)
-- [x] Selection range (`textDocument/selectionRange`) — requires Neovim 0.12+
-
 🚧 **Not Tested (may or may not work):**
 
-- Semantic tokens (`textDocument/semanticTokens`)
-- Document links (`textDocument/documentLink`)
+- Semantic tokens (`textDocument/semanticTokens`), document links
 
 🚫 **Not Supported:**
 
-- Code actions (`textDocument/codeAction`) - code actions can modify arbitrary ranges potentially spanning cell boundaries, making them tricky to implement in this notebook architecture
+- Code actions (`textDocument/codeAction`) — they can edit ranges across cell boundaries
+- ipywidgets and other JavaScript outputs (need a browser; `:NotebookOpenOutput` opens HTML there)
+- The Jupyter debugger protocol (use nvim-dap with debugpy on the code instead)

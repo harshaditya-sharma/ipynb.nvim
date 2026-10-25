@@ -112,7 +112,7 @@ lua/ipynb/
 ├── io.lua             # File I/O (ipynb ↔ jupytext format)
 ├── facade.lua         # Facade buffer rendering, treesitter activation
 ├── cells.lua          # Cell boundary tracking (extmarks)
-├── edit.lua           # Edit float management
+├── edit.lua           # Cell editor (overlay float or split window)
 ├── lsp/               # LSP integration (modular)
 │   ├── init.lua       # Public API, orchestrates submodules
 │   ├── util.lua       # Shared helpers (resolve_bufnr, get_buffer_context)
@@ -126,17 +126,20 @@ lua/ipynb/
 │   └── completion.lua # Completion and edit buffer diagnostics
 ├── visuals.lua        # Cell decorations, borders, highlights
 ├── util.lua           # Shared helpers
-├── words.lua          # Word lists for human-readable cell IDs (JEP 62 Option D)
 ├── keymaps.lua        # Keymap definitions
 ├── kernel.lua         # Jupyter kernel connection (per-notebook state)
-├── output.lua         # Cell output rendering
+├── output.lua         # Cell output rendering (ANSI, rich fallbacks, truncation)
+├── ansi.lua           # ANSI colour codes -> highlight chunks
+├── cellmeta.lua       # Tags, titles, hidden code/outputs (JupyterLab/Colab/Databricks)
+├── magics.lua         # Mask IPython syntax for Python language servers
+├── repl.lua           # iron.nvim REPL fallback
+├── termimage.lua      # Sixel / iTerm2 inline images
 ├── images.lua         # Image output rendering (via snacks.nvim)
 ├── inspector.lua      # Variable inspector (Jupyter inspect protocol)
 ├── folding.lua        # Cell folding support
 ├── picker.lua         # Cell picker (vim.ui.select)
 ├── commands.lua       # User commands
-├── health.lua         # Health check (:checkhealth ipynb)
-└── debug.lua          # Debug utilities (check_treesitter, show_tree)
+└── health.lua         # Health check (:checkhealth ipynb)
 
 tree-sitter-ipynb/
 ├── grammar.js         # Tree-sitter grammar definition (language-agnostic cell parsing)
@@ -172,28 +175,17 @@ tests/
 
 ### 1b. Cell Identity
 
-Each cell has a unique `id` field generated at creation time:
-
-```lua
--- Format: adjective-animal (JEP 62 Option D), e.g., "bold-fox"
-cell.id = words.adjectives[... ] .. '-' .. words.animals[...]
-```
+Each cell has a unique `id` (nbformat 4.5): 8 hex characters, like Jupyter.
+IDs read from a file must match `^[a-zA-Z0-9-_]{1,64}$`; anything else is
+replaced on load (IDs are also used in image cache file names).
 
 **Why unique IDs matter:**
 
 - Images are stored in `state.images` keyed by `cell.id`
 - When cells are moved/inserted/deleted, indices change but IDs persist
-- `sync_cells_from_facade` matches cells by content to preserve IDs across undo
-- Outputs, edit buffers, and extmarks stay associated with the correct cell
-- Edit state tracks `cell_id` to find the correct cell after undo/redo
-
-**ID lifecycle:**
-
-- Generated when cell is created (`insert_cell`, `read_ipynb`)
-- Preserved during `sync_cells_from_facade` by:
-  1. First trying to match by content (exact source match)
-  2. Falling back to position-based matching (same index, same type)
-- New ID generated only if no matching old cell found
+- Kernel messages are routed to cells by ID
+- `sync_cells_from_facade` keeps IDs (and outputs, metadata, attachments)
+  across undo: first by exact content match, then by position and type
 
 ---
 

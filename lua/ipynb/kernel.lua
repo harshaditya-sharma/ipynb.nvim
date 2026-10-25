@@ -282,6 +282,7 @@ local function handle_message(state, msg)
     kernel.connected = true
     kernel.kernel_id = msg.kernel_id
     kernel.kernel_name = msg.kernel_name or kernel.kernel_name
+    kernel.log_path = msg.log_path
     kernel.execution_state = "idle"
     adopt_kernel_language(state, msg.language)
     vim.schedule(function()
@@ -599,6 +600,7 @@ function M.start_bridge(state, python_path)
     end,
     stdout_buffered = false,
     stderr_buffered = false,
+    env = { IPYNB_KERNEL_LOG_DIR = vim.fn.stdpath("log") .. "/ipynb.nvim" },
   })
 
   if job_id <= 0 then
@@ -978,6 +980,9 @@ function M.format_info(state)
   }
   if info.running_kernel then
     table.insert(lines, 'Running kernel: ' .. info.running_kernel)
+  end
+  if state.kernel and state.kernel.log_path then
+    table.insert(lines, 'Kernel log: ' .. state.kernel.log_path)
   end
   return lines
 end

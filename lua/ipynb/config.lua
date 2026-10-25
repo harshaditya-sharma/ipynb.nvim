@@ -234,16 +234,16 @@ M.defaults = {
 	folding = {
 		hide_output = false, -- Include end marker in fold to hide output when folded
 	},
-		format = {
-			enabled = true, -- Wrap vim.lsp.buf.format() to work with notebooks
-			trailing_blank_lines = 0, -- Max trailing blank lines to keep after formatting
-		},
-		shadow = {
-			location = "temp", -- "temp" (default) or "workspace"
-			dir = ".ipynb.nvim",
-			debounce_ms = 400,
-		},
-	}
+	format = {
+		enabled = true, -- Wrap vim.lsp.buf.format() to work with notebooks
+		trailing_blank_lines = 0, -- Max trailing blank lines to keep after formatting
+	},
+	shadow = {
+		location = "temp", -- "temp" (default) or "workspace"
+		dir = ".ipynb.nvim",
+		debounce_ms = 400,
+	},
+}
 
 -- Current configuration (populated by setup)
 ---@type NotebookConfig

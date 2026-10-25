@@ -14,6 +14,7 @@ inspect never blocks an interrupt.
 import asyncio
 import inspect
 import json
+import os
 import sys
 import threading
 import uuid
@@ -65,6 +66,7 @@ class KernelBridge:
         self.inputs: Dict[str, str] = {}  # input request_id -> execute msg_id
         self.tasks: list = []
         self.remote = None  # RemoteKernel when connected to a Jupyter server
+        self.iopub_waiters: Dict[str, asyncio.Future] = {}  # kernel_info msg_id -> iopub seen
 
     # -- output -----------------------------------------------------------------
 
@@ -99,7 +101,18 @@ class KernelBridge:
         try:
             self.kernel_name = kernel_name
             self.km = AsyncKernelManager(kernel_name=kernel_name)
-            await self.km.start_kernel()
+            # Kernel stdout/stderr (its own logs, C-level prints) go to a log
+            # file, not our stderr, which Neovim shows as warnings
+            self.log_path = None
+            kwargs = {}
+            log_dir = os.environ.get("IPYNB_KERNEL_LOG_DIR")
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+                safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in kernel_name)
+                self.log_path = os.path.join(log_dir, f"kernel-{safe}.log")
+                log = open(self.log_path, "ab")
+                kwargs = {"stdout": log, "stderr": log}
+            await self.km.start_kernel(**kwargs)
             self.owns_kernel = True
             await self._attach()
             self.send({
@@ -107,6 +120,7 @@ class KernelBridge:
                 "kernel_name": kernel_name,
                 "kernel_id": getattr(self.km, "kernel_id", None) or "unknown",
                 "language": self.language,
+                "log_path": self.log_path,
             })
         except Exception as e:
             self.error(f"Failed to start kernel: {e}")
@@ -261,17 +275,24 @@ class KernelBridge:
     async def _wait_ready(self) -> None:
         # The shell pump owns the shell socket now, so poll with kernel_info
         # requests instead of kc.wait_for_ready (which reads the socket itself).
+        # Ready means the shell answers AND iopub delivers a status for that
+        # request: after a restart a Jupyter server can resubscribe iopub a
+        # moment after shell works, and outputs sent before that are lost.
         deadline = self.loop.time() + READY_TIMEOUT
         while self.loop.time() < deadline:
-            future = self.loop.create_future()
+            reply = self.loop.create_future()
+            iopub = self.loop.create_future()
             msg_id = self.kc.kernel_info()
-            self.replies[msg_id] = future
+            self.replies[msg_id] = reply
+            self.iopub_waiters[msg_id] = iopub
             try:
-                await asyncio.wait_for(future, 2)
+                await asyncio.wait_for(asyncio.gather(reply, iopub), 2)
                 return
             except asyncio.TimeoutError:
                 self.replies.pop(msg_id, None)
-        raise TimeoutError("kernel did not become ready after restart")
+            finally:
+                self.iopub_waiters.pop(msg_id, None)
+        raise TimeoutError("kernel did not become ready")
 
     def _drop_pending(self) -> None:
         for future in self.replies.values():
@@ -309,6 +330,9 @@ class KernelBridge:
         date = _iso(msg.get("header", {}).get("date"))
 
         if msg_type == "status":
+            waiter = self.iopub_waiters.get(msg.get("parent_header", {}).get("msg_id", ""))
+            if waiter and not waiter.done():
+                waiter.set_result(True)
             self.send({"type": "status", "state": content.get("execution_state", ""),
                        "cell_id": cell_id, "date": date})
         elif msg_type == "execute_input":
