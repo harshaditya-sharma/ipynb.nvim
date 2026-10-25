@@ -5,6 +5,7 @@ local M = {}
 
 local output_ns = vim.api.nvim_create_namespace('notebook_outputs')
 local ansi = require('ipynb.ansi')
+local termimage = require('ipynb.termimage')
 
 ---Convert Jupyter text to string (handles both string and array formats)
 ---@param text string|table|nil
@@ -324,6 +325,7 @@ function M.render_outputs(state, cell_idx)
   end
   if cell.id then
     images_mod.clear_images(state, cell.id)
+    termimage.clear(state.facade_buf, cell.id)
   end
   if not end_line or not cell.outputs or #cell.outputs == 0 then
     return
@@ -340,8 +342,16 @@ function M.render_outputs(state, cell_idx)
     local text_lines, dropped = 0, 0
     local image_index = 0
     for _, output in ipairs(cell.outputs) do
-      local has_image = images_mod.get_image_data(output)
-      if has_image and images_mod.supports_placeholders() then
+      local has_image, mime, image_data, is_text = images_mod.get_image_data(output)
+      local term_lines
+      if has_image and not images_mod.supports_placeholders() and termimage.backend() and mime ~= 'application/pdf' then
+        -- Sixel / iTerm2: reserve rows now, draw over them after Neovim redraws
+        local bytes = is_text and image_data or images_mod._base64_decode(image_data)
+        term_lines = bytes and termimage.reserve(state, cell, bytes, #virt_lines + 1, M.text_width(state))
+      end
+      if term_lines then
+        vim.list_extend(virt_lines, term_lines)
+      elseif has_image and images_mod.supports_placeholders() then
         image_index = image_index + 1
         local img_lines = images_mod.get_image_virt_lines(state, cell, output, image_index)
         if img_lines then
@@ -376,6 +386,23 @@ function M.render_outputs(state, cell_idx)
     undo_restore = false,
     strict = false,
   })
+  if termimage.backend() then
+    termimage.setup_autocmds()
+    termimage.redraw({ force = true })
+  end
+end
+
+---Usable text width of the window showing the notebook (for image sizing)
+---@param state NotebookState
+---@return number
+function M.text_width(state)
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_get_buf(win) == state.facade_buf then
+      local info = vim.fn.getwininfo(win)[1] or {}
+      return vim.api.nvim_win_get_width(win) - (info.textoff or 0) - 2
+    end
+  end
+  return 78
 end
 
 local EXTERNAL_MIMES = {
@@ -504,6 +531,7 @@ function M.clear_outputs(state, cell_idx)
   -- Clear images first (using cell.id)
   if cell.id then
     images_mod.clear_images(state, cell.id)
+    termimage.clear(state.facade_buf, cell.id)
   end
 
   -- Clear output extmark

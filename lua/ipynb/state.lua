@@ -195,6 +195,10 @@ function M.remove(buf)
       images_mod.clear_all_images(state)
     end
 
+    pcall(function()
+      require('ipynb.termimage').clear_buffer(buf)
+    end)
+
     -- Cleanup fold cache
     local fold_ok, folding_mod = pcall(require, 'ipynb.folding')
     if fold_ok then

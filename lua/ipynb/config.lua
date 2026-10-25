@@ -111,7 +111,10 @@ local M = {}
 ---@field record_timing boolean Save start/end times in cell metadata like JupyterLab's "Record cell timing"
 
 ---@class ImageConfig
----@field enabled boolean Enable image rendering (requires snacks.nvim)
+---@field enabled boolean Enable inline images
+---@field backend "auto"|"kitty"|"sixel"|"iterm2"|"none" Graphics protocol (auto-detected from the terminal)
+---@field cell_size number[] Terminal cell { width, height } in pixels (Sixel sizing)
+---@field max_rows number Tallest inline Sixel/iTerm2 image, in rows
 ---@field cache_dir string Directory to cache decoded images
 ---@field max_width number|nil Maximum image width in terminal columns (nil = window width minus sign/number columns)
 ---@field max_height number|nil Maximum image height in terminal rows (nil = window height minus scrolloff minus 1)
@@ -213,6 +216,9 @@ M.defaults = {
 	},
 	images = {
 		enabled = true,
+		backend = "auto", -- "auto", "kitty" (snacks.nvim), "sixel", "iterm2" or "none"
+		cell_size = { 10, 20 }, -- terminal cell size in pixels, used to size Sixel images
+		max_rows = 20, -- tallest inline image (Sixel / iTerm2), in rows
 		cache_dir = vim.fn.stdpath("cache") .. "/ipynb.nvim",
 		max_width = nil, -- nil = window width minus sign/number columns
 		max_height = nil, -- nil = window height minus scrolloff minus 1

@@ -399,6 +399,7 @@ local tests = {
   join(root, 'tests/test_features.lua'),
   join(root, 'tests/test_remote_e2e.lua'),
   join(root, 'tests/test_repl.lua'),
+  join(root, 'tests/test_termimage.lua'),
   join(root, 'tests/test_shadow.lua'),
   join(root, 'tests/test_lsp.lua'),
   join(root, 'tests/test_lsp_go.lua'),
