@@ -943,6 +943,19 @@ function M.setup_edit_keymaps(state)
     end
   end
 
+  if km.repl_send_cell and km.repl_send_cell ~= '' then
+    vim.keymap.set('n', km.repl_send_cell, function()
+      if state.edit_state then
+        require('ipynb.repl').send_cell(state, state.edit_state.cell_idx)
+      end
+    end, vim.tbl_extend('force', opts, { desc = 'REPL send cell' }))
+    vim.keymap.set('x', km.repl_send_cell, function()
+      local lines = vim.fn.getregion(vim.fn.getpos('v'), vim.fn.getpos('.'), { type = vim.fn.mode() })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes('<Esc>', true, false, true), 'nx', false)
+      require('ipynb.repl').send(state, lines)
+    end, vim.tbl_extend('force', opts, { desc = 'REPL send selection' }))
+  end
+
   if km.split_cell and km.split_cell ~= '' then
     vim.keymap.set({ 'n', 'i' }, km.split_cell, function()
       M.split_cell(state)

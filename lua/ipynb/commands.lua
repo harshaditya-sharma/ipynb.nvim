@@ -169,6 +169,12 @@ function M.setup_buffer(state)
     { 'NotebookKernelConnect', function(opts)
       kernel.connect(state, { connection_file = opts.args })
     end, 'Connect to existing Jupyter kernel', { nargs = 1, complete = 'file' } },
+    { 'NotebookReplSend', function()
+      local idx = current_cell()
+      if idx then
+        require('ipynb.repl').send_cell(state, idx)
+      end
+    end, 'Send cell to the iron.nvim REPL' },
     { 'NotebookServerConnect', function(opts)
       kernel.connect_server(state, opts.fargs[1], opts.fargs[2])
     end, 'Use a kernel on a Jupyter server (URL [kernel id or name])', { nargs = '+' } },

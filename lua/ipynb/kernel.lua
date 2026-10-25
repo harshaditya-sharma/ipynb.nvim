@@ -765,6 +765,23 @@ end
 ---@return boolean success
 function M.execute(state, cell_idx, code)
   if not state.kernel or not state.kernel.connected then
+    -- No Jupyter kernel: fall back to an iron.nvim REPL when available
+    local repl = require("ipynb.repl")
+    if require("ipynb.config").get().repl.fallback and repl.available() then
+      local cell = state.cells[cell_idx]
+      if not cell or cell.type ~= "code" then
+        return false
+      end
+      if not state._repl_notice then
+        state._repl_notice = true
+        vim.notify("No Jupyter kernel: running in the iron.nvim " .. repl.filetype(state)
+          .. " REPL (output shows there). :NotebookKernelStart for inline output.", vim.log.levels.INFO)
+      end
+      if code then
+        return repl.send(state, vim.split(code, "\n", { plain = true }))
+      end
+      return repl.send_cell(state, cell_idx)
+    end
     vim.notify("No kernel connected. Use :NotebookKernelStart", vim.log.levels.WARN)
     return false
   end

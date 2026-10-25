@@ -14,6 +14,10 @@ local M = {}
 ---@field format FormatConfig
 ---@field shadow ShadowConfig
 ---@field output OutputConfig
+---@field repl ReplConfig
+
+---@class ReplConfig
+---@field fallback boolean Run cells in an iron.nvim REPL when no Jupyter kernel is connected
 
 ---@class OutputConfig
 ---@field max_lines number Text lines shown inline per cell before truncating (0 = no limit)
@@ -60,6 +64,7 @@ local M = {}
 ---@field toggle_outputs_hidden string|nil Hide/show cell outputs (default: nil)
 ---@field open_output_external string|nil Open rich output in the system viewer (default: nil)
 ---@field edit_tags string|nil Edit cell tags (default: nil)
+---@field repl_send_cell string|nil Send cell/selection to the iron.nvim REPL (default: nil)
 ---@field kernel_interrupt string Interrupt kernel (menu) (default: '<leader>ki')
 ---@field kernel_restart string Restart kernel (default: '<leader>k0')
 ---@field kernel_start string Start kernel (default: '<leader>ks')
@@ -164,6 +169,7 @@ M.defaults = {
 		toggle_outputs_hidden = nil, -- Hide/show the cell's outputs, saved like JupyterLab (unmapped)
 		open_output_external = nil, -- Open image/HTML output in the system viewer (unmapped)
 		edit_tags = nil, -- Edit the cell's tags (unmapped)
+		repl_send_cell = nil, -- Send cell (or selection in the cell editor) to the iron.nvim REPL (unmapped)
 		kernel_interrupt = "<leader>ki",
 		kernel_restart = "<leader>k0",
 		kernel_start = "<leader>ks",
@@ -192,6 +198,9 @@ M.defaults = {
 		enabled = true,
 		show_on_hover = true,
 		show_on_edit = true,
+	},
+	repl = {
+		fallback = true, -- with no Jupyter kernel, run cells in an iron.nvim REPL (if installed)
 	},
 	output = {
 		max_lines = 100, -- inline text lines per cell; the rest via open_output (0 = no limit)

@@ -235,6 +235,12 @@ function M.setup_facade_keymaps(state)
     { km.toggle_outputs_hidden, function() require('ipynb.output').toggle_outputs_hidden(state) end, 'Cell hide/show outputs' },
     { km.open_output_external, function() require('ipynb.output').open_external(state) end, 'Output open in system viewer' },
     { km.edit_tags, function() M.edit_tags(state) end, 'Cell edit tags' },
+    { km.repl_send_cell, function()
+      local idx = get_cell_at_cursor(state)
+      if idx then
+        require('ipynb.repl').send_cell(state, idx)
+      end
+    end, 'REPL send cell' },
   }
   for _, map in ipairs(optional) do
     set_keymap_if_configured('n', map[1], map[2], vim.tbl_extend('force', opts, { desc = map[3] }))
