@@ -180,12 +180,17 @@ def test_magics_and_shell_commands(bridge):
     assert "shell-ok" in text and "Wall time" in text
 
 
-def test_complete_while_cell_runs(bridge):
+def test_completion_queued_behind_a_cell_gets_its_own_reply(bridge):
+    # The kernel answers shell requests in order, so completion waits for the
+    # running cell; neither reply may be mistaken for the other.
     bridge.send(action="execute", code="import time; time.sleep(1.5)", cell_id="c-busy")
     bridge.send(action="complete", code="pri", cursor_pos=3, request_id="r1")
-    reply = bridge.wait(lambda m: m["type"] == "complete_reply", timeout=10)
-    assert reply and reply["request_id"] == "r1" and "print" in reply["matches"]
-    bridge.wait(lambda m: m.get("type") == "execute_reply" and m.get("cell_id") == "c-busy")
+    msgs = bridge.collect_until(lambda m: m.get("type") == "complete_reply", timeout=15)
+    reply = msgs[-1]
+    assert reply["request_id"] == "r1" and "print" in reply["matches"]
+    assert any(m.get("type") == "execute_reply" and m.get("cell_id") == "c-busy" for m in msgs + [
+        bridge.wait(lambda m: m.get("type") == "execute_reply" and m.get("cell_id") == "c-busy", timeout=5) or {}
+    ])
 
 
 def test_inspect_returns_sections(bridge):

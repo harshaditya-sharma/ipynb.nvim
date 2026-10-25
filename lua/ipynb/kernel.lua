@@ -447,6 +447,15 @@ local function handle_message(state, msg)
       kernel.callbacks.inspect[request_id] = nil
     end
 
+  elseif msg_type == "server_kernels" then
+    local cb = kernel.callbacks.server_kernels
+    kernel.callbacks.server_kernels = nil
+    if cb then
+      vim.schedule(function()
+        cb(msg.kernels or {})
+      end)
+    end
+
   elseif msg_type == "pong" then
     if kernel.callbacks.ping then
       kernel.callbacks.ping()
@@ -678,7 +687,14 @@ function M.connect(state, opts)
   local kernel_name = M.get_kernel_name(state)
 
   vim.defer_fn(function()
-    if opts.connection_file then
+    if opts.server_url then
+      -- Kernel on a Jupyter server: attach to a kernel id or start by name
+      send_command(state, {
+        action = "connect_server",
+        url = opts.server_url,
+        kernel = opts.kernel or kernel_name,
+      })
+    elseif opts.connection_file then
       send_command(state, {
         action = "connect",
         connection_file = opts.connection_file,
@@ -692,6 +708,46 @@ function M.connect(state, opts)
   end, 100)
 
   return true
+end
+
+---Kernels running on a Jupyter server
+---@param state NotebookState
+---@param url string Server URL, e.g. http://localhost:8888/?token=...
+---@param callback fun(kernels: table[])
+function M.list_server_kernels(state, url, callback)
+  if not M.start_bridge(state, nil) then
+    return
+  end
+  state.kernel.callbacks.server_kernels = callback
+  send_command(state, { action = "list_server_kernels", url = url })
+end
+
+---Connect to a kernel on a Jupyter server, asking which one if not given
+---@param state NotebookState
+---@param url string
+---@param kernel string|nil Running kernel id, or a kernelspec name to start
+function M.connect_server(state, url, kernel)
+  if kernel then
+    M.connect(state, { server_url = url, kernel = kernel })
+    return
+  end
+  M.list_server_kernels(state, url, function(kernels)
+    local name = M.get_kernel_name(state)
+    local choices = { { label = 'Start a new ' .. name .. ' kernel', kernel = name } }
+    for _, k in ipairs(kernels) do
+      table.insert(choices, {
+        label = string.format('Attach to %s %s (%s, %s connection%s)', k.name or '?', (k.id or ''):sub(1, 8),
+          k.execution_state or '?', tostring(k.connections or 0), k.connections == 1 and '' or 's'),
+        kernel = k.id,
+      })
+    end
+    vim.ui.select(choices, { prompt = 'Jupyter server kernel', format_item = function(c) return c.label end },
+      function(choice)
+        if choice then
+          M.connect(state, { server_url = url, kernel = choice.kernel })
+        end
+      end)
+  end)
 end
 
 ---Disconnect from kernel

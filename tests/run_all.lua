@@ -397,6 +397,7 @@ local tests = {
   join(root, 'tests/test_kernel_e2e.lua'),
   join(root, 'tests/test_split_editor.lua'),
   join(root, 'tests/test_features.lua'),
+  join(root, 'tests/test_remote_e2e.lua'),
   join(root, 'tests/test_shadow.lua'),
   join(root, 'tests/test_lsp.lua'),
   join(root, 'tests/test_lsp_go.lua'),
@@ -408,6 +409,21 @@ for _, test in ipairs(tests) do
   if not ok then
     total_failed = total_failed + 1
   end
+end
+
+-- Python bridge tests (real kernels / Jupyter server) when a test Python is set
+local py = vim.env.IPYNB_TEST_PYTHON
+if py and py ~= '' and vim.system({ py, '-c', 'import pytest, jupyter_client, ipykernel' }):wait().code == 0 then
+  print('>>> Running python bridge tests...')
+  local r = vim.system({ py, '-m', 'pytest', '-q', join(root, 'tests/test_kernel_bridge.py'), join(root, 'tests/test_remote_kernel.py') },
+    { text = true, cwd = root, env = { PYTHONIOENCODING = 'utf-8' } }):wait(900000)
+  print(((r.stdout or '') .. (r.stderr or '')):match('[^\n]*passed[^\n]*') or (r.stdout or ''))
+  if r.code ~= 0 then
+    print(r.stdout or '')
+    total_failed = total_failed + 1
+  end
+else
+  print('SKIP: python bridge tests (set IPYNB_TEST_PYTHON to a Python with pytest, jupyter_client, ipykernel)')
 end
 
 print('')

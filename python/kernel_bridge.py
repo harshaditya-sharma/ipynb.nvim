@@ -64,6 +64,7 @@ class KernelBridge:
         self.replies: Dict[str, asyncio.Future] = {}  # shell msg_id -> reply future
         self.inputs: Dict[str, str] = {}  # input request_id -> execute msg_id
         self.tasks: list = []
+        self.remote = None  # RemoteKernel when connected to a Jupyter server
 
     # -- output -----------------------------------------------------------------
 
@@ -127,7 +128,82 @@ class KernelBridge:
         except Exception as e:
             self.error(f"Failed to connect to kernel: {e}")
 
+    async def connect_server(self, url: str, kernel: Optional[str]) -> None:
+        """Use a kernel on a Jupyter server: attach to a running kernel id, or
+        start one by kernelspec name (default python3)."""
+        if self.kc:
+            self.error("Kernel already running")
+            return
+        from remote_kernel import RemoteKernel, parse_server_url
+
+        try:
+            base_url, token = parse_server_url(url)
+            remote = RemoteKernel(base_url, token, self._on_remote)
+            running = {k["id"]: k for k in await remote.list_kernels()}
+            if kernel and kernel in running:
+                await remote.attach(kernel)
+            else:
+                await remote.start(kernel or "python3")
+            self.remote, self.kc = remote, remote
+            self.owns_kernel = remote.owned
+            self.kernel_name = remote.kernel_name or (kernel or "python3")
+            self.language = await remote.kernel_language()
+            self.tasks = [asyncio.ensure_future(self._run_remote())]
+            await self._wait_ready()
+            self.send({
+                "type": "kernel_connected",
+                "server": base_url,  # never echo the token
+                "kernel_id": remote.kernel_id,
+                "kernel_name": self.kernel_name,
+                "language": self.language,
+                "attached": not remote.owned,
+            })
+        except Exception as e:
+            self.remote = None
+            self.kc = None
+            self.error(f"Failed to connect to Jupyter server: {e}")
+
+    async def list_server_kernels(self, url: str) -> None:
+        from remote_kernel import RemoteKernel, parse_server_url
+
+        try:
+            base_url, token = parse_server_url(url)
+            kernels = await RemoteKernel(base_url, token, lambda *_: None).list_kernels()
+            self.send({"type": "server_kernels", "server": base_url, "kernels": [
+                {"id": k.get("id"), "name": k.get("name"), "execution_state": k.get("execution_state"),
+                 "connections": k.get("connections"), "last_activity": k.get("last_activity")}
+                for k in kernels
+            ]})
+        except Exception as e:
+            self.error(f"Failed to list kernels: {e}")
+
+    def _on_remote(self, channel: str, msg: Dict[str, Any]) -> None:
+        handler = {"iopub": self._on_iopub, "shell": self._on_shell, "stdin": self._on_stdin}.get(channel)
+        if handler:
+            try:
+                handler(msg)
+            except Exception as e:
+                self.error(f"Failed to handle {msg.get('msg_type', '?')}: {e}")
+
+    async def _run_remote(self) -> None:
+        try:
+            await self.remote.run()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.error(f"Connection to Jupyter server lost: {e}")
+        if self.remote is not None:
+            self.error("Connection to Jupyter server closed")
+
     async def interrupt(self) -> None:
+        if self.remote:
+            try:
+                await self.remote.interrupt()
+                self.inputs.clear()
+                self.send({"type": "interrupted"})
+            except Exception as e:
+                self.error(f"Failed to interrupt: {e}")
+            return
         if not self.km:
             return
         try:
@@ -143,6 +219,15 @@ class KernelBridge:
             self.error(f"Failed to interrupt: {e}")
 
     async def restart(self) -> None:
+        if self.remote:
+            try:
+                self._drop_pending()
+                await self.remote.restart()
+                await self._wait_ready()
+                self.send({"type": "restarted"})
+            except Exception as e:
+                self.error(f"Failed to restart: {e}")
+            return
         if not self.km or not self.owns_kernel:
             self.error("Restart is only available for kernels started by ipynb.nvim")
             return
@@ -159,7 +244,10 @@ class KernelBridge:
             task.cancel()
         self.tasks = []
         self._drop_pending()
-        if self.kc:
+        if self.remote:
+            remote, self.remote = self.remote, None
+            await remote.close()
+        elif self.kc:
             self.kc.stop_channels()
         if self.km and self.owns_kernel:
             try:
@@ -351,7 +439,9 @@ class KernelBridge:
 
     async def is_alive(self) -> None:
         alive = False
-        if self.km and self.owns_kernel:
+        if self.remote:
+            alive = self.remote.ws is not None
+        elif self.km and self.owns_kernel:
             alive = self.km.is_alive()
         elif self.kc:
             alive = self.kc.is_alive()
@@ -369,6 +459,13 @@ class KernelBridge:
                 await self.connect(cmd["connection_file"])
             else:
                 self.error("Missing connection_file parameter")
+        elif action == "connect_server":
+            if cmd.get("url"):
+                await self.connect_server(cmd["url"], cmd.get("kernel"))
+            else:
+                self.error("Missing url parameter")
+        elif action == "list_server_kernels":
+            await self.list_server_kernels(cmd.get("url", ""))
         elif action == "execute":
             cell_id = cmd.get("cell_id")
             if not isinstance(cell_id, str) or not cell_id:

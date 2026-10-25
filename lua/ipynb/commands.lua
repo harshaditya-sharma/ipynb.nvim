@@ -169,6 +169,9 @@ function M.setup_buffer(state)
     { 'NotebookKernelConnect', function(opts)
       kernel.connect(state, { connection_file = opts.args })
     end, 'Connect to existing Jupyter kernel', { nargs = 1, complete = 'file' } },
+    { 'NotebookServerConnect', function(opts)
+      kernel.connect_server(state, opts.fargs[1], opts.fargs[2])
+    end, 'Use a kernel on a Jupyter server (URL [kernel id or name])', { nargs = '+' } },
     { 'NotebookKernelInterrupt', call('ipynb.kernel', 'interrupt', state), 'Interrupt kernel execution' },
     { 'NotebookKernelRestart', call('ipynb.kernel', 'restart', state, true), 'Restart kernel (clears outputs)' },
     { 'NotebookKernelShutdown', call('ipynb.kernel', 'shutdown', state), 'Shutdown kernel' },
