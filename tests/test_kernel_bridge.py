@@ -1,511 +1,257 @@
 #!/usr/bin/env python3
 """
-Test the kernel bridge for ipynb.nvim
+Tests for the ipynb.nvim kernel bridge against a real ipykernel.
 
-Run with: uv run python tests/test_kernel_bridge.py
-Or: uv run pytest tests/test_kernel_bridge.py -v
+Run with: python -m pytest tests/test_kernel_bridge.py -v
+(needs jupyter_client and ipykernel in the Python that runs pytest)
 """
 
-import subprocess
-import time
 import json
 import os
+import queue
+import subprocess
 import sys
+import threading
+import time
 
-# Get the path to the bridge script
+import pytest
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_DIR = os.path.dirname(SCRIPT_DIR)
 BRIDGE_PATH = os.path.join(PLUGIN_DIR, "python", "kernel_bridge.py")
 
 
-class KernelBridgeTest:
-    """Test harness for kernel bridge."""
+class Bridge:
+    """Drives kernel_bridge.py the way kernel.lua does. Works on Windows too
+    (a reader thread instead of select(), which only supports sockets there)."""
 
     def __init__(self):
-        self.proc = None
-
-    def start(self):
-        """Start the kernel bridge process."""
         self.proc = subprocess.Popen(
-            ["uv", "run", "python", BRIDGE_PATH],
+            [sys.executable, BRIDGE_PATH],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             bufsize=1,
-            cwd=PLUGIN_DIR,
         )
+        self.messages: "queue.Queue[dict]" = queue.Queue()
+        self.seen: list = []
+        threading.Thread(target=self._read, daemon=True).start()
 
-    def stop(self):
-        """Stop the kernel bridge process."""
-        if self.proc:
-            try:
-                self.send({"action": "shutdown"})
-                self.proc.wait(timeout=5)
-            except Exception:
-                self.proc.terminate()
-            self.proc = None
+    def _read(self):
+        for line in self.proc.stdout:
+            if line.strip():
+                self.messages.put(json.loads(line))
 
-    def send(self, cmd: dict):
-        """Send a command to the bridge."""
+    def send(self, **cmd):
         self.proc.stdin.write(json.dumps(cmd) + "\n")
         self.proc.stdin.flush()
 
-    def read_message(self, timeout: float = 5.0) -> dict | None:
-        """Read a single message from the bridge."""
-        import select
-
-        start = time.time()
-        while time.time() - start < timeout:
-            if select.select([self.proc.stdout], [], [], 0.1)[0]:
-                line = self.proc.stdout.readline()
-                if line:
-                    return json.loads(line.strip())
-        return None
-
-    def read_messages(self, timeout: float = 5.0) -> list[dict]:
-        """Read all available messages within timeout."""
-        import select
-
-        messages = []
-        start = time.time()
-        while time.time() - start < timeout:
-            if select.select([self.proc.stdout], [], [], 0.1)[0]:
-                line = self.proc.stdout.readline()
-                if line:
-                    messages.append(json.loads(line.strip()))
-        return messages
-
-    def wait_for_message(self, msg_type: str, timeout: float = 10.0) -> dict | None:
-        """Wait for a specific message type."""
-        start = time.time()
-        while time.time() - start < timeout:
-            msg = self.read_message(timeout=0.5)
-            if not msg:
-                continue
-
-            if msg.get("type") == msg_type:
-                return msg
-
-            if msg.get("type") == "error":
-                raise AssertionError(
-                    f"Bridge error while waiting for '{msg_type}': {msg.get('error', 'Unknown error')}"
-                )
-        return None
-
-
-def test_bridge_ready():
-    """Test that bridge starts and sends ready message."""
-    bridge = KernelBridgeTest()
-    try:
-        bridge.start()
-        msg = bridge.read_message(timeout=5)
-        assert msg is not None, "No message received"
-        assert msg["type"] == "ready", f"Expected 'ready', got {msg['type']}"
-        print("PASS: Bridge starts and sends ready message")
-    finally:
-        bridge.stop()
-
-
-def test_ping_pong():
-    """Test ping/pong functionality."""
-    bridge = KernelBridgeTest()
-    try:
-        bridge.start()
-        bridge.read_message()  # consume ready
-
-        bridge.send({"action": "ping"})
-        msg = bridge.read_message(timeout=2)
-        assert msg is not None, "No pong received"
-        assert msg["type"] == "pong", f"Expected 'pong', got {msg['type']}"
-        print("PASS: Ping/pong works")
-    finally:
-        bridge.stop()
-
-
-def test_kernel_start():
-    """Test starting a kernel."""
-    bridge = KernelBridgeTest()
-    try:
-        bridge.start()
-        bridge.read_message()  # consume ready
-
-        bridge.send({"action": "start", "kernel_name": "python3"})
-        msg = bridge.wait_for_message("kernel_started", timeout=30)
-        assert msg is not None, "Kernel did not start"
-        assert msg["kernel_name"] == "python3"
-        assert "kernel_id" in msg
-        print(f"PASS: Kernel started with ID {msg['kernel_id']}")
-    finally:
-        bridge.stop()
-
-
-def test_code_execution():
-    """Test executing code in the kernel."""
-    bridge = KernelBridgeTest()
-    try:
-        bridge.start()
-        bridge.read_message()  # consume ready
-
-        # Start kernel
-        bridge.send({"action": "start", "kernel_name": "python3"})
-        msg = bridge.wait_for_message("kernel_started", timeout=30)
-        assert msg is not None, "Kernel did not start"
-
-        # Execute code
-        bridge.send({
-            "action": "execute",
-            "code": "print('Hello from test!')",
-            "cell_id": "cell-0"
-        })
-
-        # Collect messages until idle
-        messages = []
-        while True:
-            msg = bridge.read_message(timeout=10)
-            if msg is None:
-                break
-            messages.append(msg)
-            if msg.get("type") == "status" and msg.get("state") == "idle":
-                break
-
-        # Verify we got expected message types
-        msg_types = [m["type"] for m in messages]
-        assert "execute_request" in msg_types, "Missing execute_request"
-        assert "output" in msg_types, "Missing output"
-
-        # Find the output message
-        output_msg = next((m for m in messages if m["type"] == "output"), None)
-        assert output_msg is not None
-        assert output_msg["output"]["output_type"] == "stream"
-        assert "Hello from test!" in output_msg["output"]["text"]
-
-        print("PASS: Code execution works")
-    finally:
-        bridge.stop()
-
-
-def test_execution_count():
-    """Test that execution count increments."""
-    bridge = KernelBridgeTest()
-    try:
-        bridge.start()
-        bridge.read_message()  # consume ready
-
-        # Start kernel
-        bridge.send({"action": "start", "kernel_name": "python3"})
-        bridge.wait_for_message("kernel_started", timeout=30)
-
-        # Execute twice
-        for i in range(2):
-            bridge.send({
-                "action": "execute",
-                "code": f"x = {i}",
-                "cell_id": f"cell-{i}"
-            })
-            # Wait for idle
-            while True:
-                msg = bridge.read_message(timeout=10)
-                if msg and msg.get("type") == "status" and msg.get("state") == "idle":
-                    break
-
-        # Execute a third time and check execution count
-        bridge.send({
-            "action": "execute",
-            "code": "y = 2",
-            "cell_id": "cell-2"
-        })
-
-        exec_input = bridge.wait_for_message("execute_input", timeout=10)
-        assert exec_input is not None
-        assert exec_input["execution_count"] == 3, f"Expected count 3, got {exec_input['execution_count']}"
-
-        print("PASS: Execution count increments correctly")
-    finally:
-        bridge.stop()
-
-
-def test_execute_result():
-    """Test execute_result output type."""
-    bridge = KernelBridgeTest()
-    try:
-        bridge.start()
-        bridge.read_message()  # consume ready
-
-        # Start kernel
-        bridge.send({"action": "start", "kernel_name": "python3"})
-        bridge.wait_for_message("kernel_started", timeout=30)
-
-        # Execute expression (should produce execute_result)
-        bridge.send({
-            "action": "execute",
-            "code": "1 + 1",
-            "cell_id": "cell-0"
-        })
-
-        # Collect until idle
-        messages = []
-        while True:
-            msg = bridge.read_message(timeout=10)
-            if msg is None:
-                break
-            messages.append(msg)
-            if msg.get("type") == "status" and msg.get("state") == "idle":
-                break
-
-        # Find execute_result
-        result_msg = next(
-            (m for m in messages if m["type"] == "output" and
-             m["output"]["output_type"] == "execute_result"),
-            None
-        )
-        assert result_msg is not None, "Missing execute_result output"
-        assert "2" in result_msg["output"]["data"]["text/plain"]
-
-        print("PASS: Execute result works")
-    finally:
-        bridge.stop()
-
-
-def test_error_handling():
-    """Test error output from invalid code."""
-    bridge = KernelBridgeTest()
-    try:
-        bridge.start()
-        bridge.read_message()  # consume ready
-
-        # Start kernel
-        bridge.send({"action": "start", "kernel_name": "python3"})
-        bridge.wait_for_message("kernel_started", timeout=30)
-
-        # Execute invalid code
-        bridge.send({
-            "action": "execute",
-            "code": "undefined_variable",
-            "cell_id": "cell-0"
-        })
-
-        # Collect until idle
-        messages = []
-        while True:
-            msg = bridge.read_message(timeout=10)
-            if msg is None:
-                break
-            messages.append(msg)
-            if msg.get("type") == "status" and msg.get("state") == "idle":
-                break
-
-        # Find error output
-        error_msg = next(
-            (m for m in messages if m["type"] == "output" and
-             m["output"]["output_type"] == "error"),
-            None
-        )
-        assert error_msg is not None, "Missing error output"
-        assert error_msg["output"]["ename"] == "NameError"
-
-        print("PASS: Error handling works")
-    finally:
-        bridge.stop()
-
-
-def test_stdin_input_request_reply():
-    """Test input_request/input_reply roundtrip."""
-    bridge = KernelBridgeTest()
-    try:
-        bridge.start()
-        bridge.read_message()  # consume ready
-
-        # Start kernel
-        bridge.send({"action": "start", "kernel_name": "python3"})
-        bridge.wait_for_message("kernel_started", timeout=30)
-
-        # Execute code that requires stdin input
-        bridge.send({
-            "action": "execute",
-            "code": "name = input('Name: '); print('Hello', name)",
-            "cell_id": "cell-input"
-        })
-
-        input_req = bridge.wait_for_message("input_request", timeout=10)
-        assert input_req is not None, "Missing input_request"
-        assert input_req.get("request_id"), "Missing request_id in input_request"
-        assert "Name:" in input_req.get("prompt", ""), "Unexpected prompt"
-
-        bridge.send({
-            "action": "input_reply",
-            "request_id": input_req["request_id"],
-            "value": "Mohan",
-        })
-
-        messages = []
-        while True:
-            msg = bridge.read_message(timeout=10)
-            if msg is None:
-                break
-            messages.append(msg)
-            if msg.get("type") == "status" and msg.get("state") == "idle":
-                break
-
-        output_msg = next(
-            (
-                m for m in messages
-                if m.get("type") == "output"
-                and m.get("output", {}).get("output_type") == "stream"
-                and "Hello Mohan" in m.get("output", {}).get("text", "")
-            ),
-            None,
-        )
-        assert output_msg is not None, "Missing expected stream output after input_reply"
-
-        print("PASS: Stdin input_request/input_reply works")
-    finally:
-        bridge.stop()
-
-
-def test_interrupt():
-    """Test kernel interrupt."""
-    bridge = KernelBridgeTest()
-    try:
-        bridge.start()
-        bridge.read_message()  # consume ready
-
-        # Start kernel
-        bridge.send({"action": "start", "kernel_name": "python3"})
-        bridge.wait_for_message("kernel_started", timeout=30)
-
-        # Execute long-running code
-        bridge.send({
-            "action": "execute",
-            "code": "import time; time.sleep(60)",
-            "cell_id": "cell-0"
-        })
-
-        # Wait for busy state
-        bridge.wait_for_message("status", timeout=5)
-
-        # Interrupt
-        time.sleep(0.5)  # Give kernel time to start execution
-        bridge.send({"action": "interrupt"})
-
-        # Should get interrupted message
-        msg = bridge.wait_for_message("interrupted", timeout=10)
-        assert msg is not None, "Interrupt did not work"
-
-        print("PASS: Kernel interrupt works")
-    finally:
-        bridge.stop()
-
-
-def test_restart():
-    """Test kernel restart."""
-    bridge = KernelBridgeTest()
-    try:
-        bridge.start()
-        bridge.read_message()  # consume ready
-
-        # Start kernel
-        bridge.send({"action": "start", "kernel_name": "python3"})
-        bridge.wait_for_message("kernel_started", timeout=30)
-
-        # Execute to set a variable
-        bridge.send({
-            "action": "execute",
-            "code": "test_var = 'before_restart'",
-            "cell_id": "cell-before-restart"
-        })
-        while True:
-            msg = bridge.read_message(timeout=10)
-            if msg and msg.get("type") == "status" and msg.get("state") == "idle":
-                break
-
-        # Restart - collect all messages until we see 'restarted'
-        bridge.send({"action": "restart"})
-
-        # Read messages until we get 'restarted' or timeout
-        restarted = False
-        start = time.time()
-        while time.time() - start < 60:
-            msg = bridge.read_message(timeout=1)
-            if msg and msg.get("type") == "restarted":
-                restarted = True
-                break
-
-        assert restarted, "Restart did not complete"
-
-        # Wait a moment for kernel to be ready
-        time.sleep(1)
-
-        # Try to access the variable (should fail)
-        bridge.send({
-            "action": "execute",
-            "code": "test_var",
-            "cell_id": "cell-after-restart"
-        })
-
-        # Should get error (variable doesn't exist)
-        messages = []
-        while True:
-            msg = bridge.read_message(timeout=10)
-            if msg is None:
-                break
-            messages.append(msg)
-            if msg.get("type") == "status" and msg.get("state") == "idle":
-                break
-
-        error_msg = next(
-            (m for m in messages if m["type"] == "output" and
-             m["output"]["output_type"] == "error"),
-            None
-        )
-        assert error_msg is not None, "Variable should not exist after restart"
-
-        print("PASS: Kernel restart works")
-    finally:
-        bridge.stop()
-
-
-def run_all_tests():
-    """Run all tests."""
-    tests = [
-        test_bridge_ready,
-        test_ping_pong,
-        test_kernel_start,
-        test_code_execution,
-        test_execution_count,
-        test_execute_result,
-        test_error_handling,
-        test_stdin_input_request_reply,
-        test_interrupt,
-        test_restart,
-    ]
-
-    print("=" * 60)
-    print("Running kernel bridge tests")
-    print("=" * 60)
-
-    passed = 0
-    failed = 0
-
-    for test in tests:
-        print(f"\n--- {test.__name__} ---")
+    def next(self, timeout=10.0):
         try:
-            test()
-            passed += 1
-        except AssertionError as e:
-            print(f"FAIL: {e}")
-            failed += 1
-        except Exception as e:
-            print(f"ERROR: {e}")
-            failed += 1
+            msg = self.messages.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        self.seen.append(msg)
+        return msg
 
-    print("\n" + "=" * 60)
-    print(f"Results: {passed} passed, {failed} failed")
-    print("=" * 60)
+    def wait(self, pred, timeout=20.0):
+        """Return the first message matching pred, or None on timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.next(timeout=max(0.05, deadline - time.time()))
+            if msg and pred(msg):
+                return msg
+        return None
 
-    return failed == 0
+    def collect_until(self, pred, timeout=20.0):
+        """All messages up to and including the first that matches pred."""
+        out = []
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.next(timeout=max(0.05, deadline - time.time()))
+            if msg:
+                out.append(msg)
+                if pred(msg):
+                    return out
+        raise AssertionError(f"timed out; got {[m.get('type') for m in out]}")
+
+    def run(self, code, cell_id, timeout=20.0):
+        """Execute code and return all messages until the cell's execute_reply."""
+        self.send(action="execute", code=code, cell_id=cell_id)
+        return self.collect_until(lambda m: m.get("type") == "execute_reply" and m.get("cell_id") == cell_id, timeout)
+
+    def close(self):
+        try:
+            self.send(action="shutdown")
+            self.proc.wait(timeout=15)
+        except Exception:
+            self.proc.kill()
 
 
-if __name__ == "__main__":
-    success = run_all_tests()
-    sys.exit(0 if success else 1)
+def outputs(msgs, cell_id=None):
+    return [m["output"] for m in msgs if m.get("type") == "output" and (cell_id is None or m.get("cell_id") == cell_id)]
+
+
+def stdout_text(msgs, cell_id=None):
+    return "".join(o.get("text", "") for o in outputs(msgs, cell_id) if o["output_type"] == "stream")
+
+
+@pytest.fixture(scope="module")
+def bridge():
+    b = Bridge()
+    assert b.next()["type"] == "ready"
+    b.send(action="start", kernel_name="python3")
+    started = b.wait(lambda m: m["type"] in ("kernel_started", "error"), timeout=90)
+    assert started and started["type"] == "kernel_started", started
+    yield b
+    b.close()
+
+
+def test_ping_pong(bridge):
+    bridge.send(action="ping")
+    assert bridge.wait(lambda m: m["type"] == "pong", timeout=5)
+
+
+def test_kernel_started_reports_language(bridge):
+    started = next(m for m in bridge.seen if m["type"] == "kernel_started")
+    assert started["kernel_name"] == "python3"
+    assert started["language"] == "python"
+    assert started["kernel_id"]
+
+
+def test_execute_stream_and_result(bridge):
+    msgs = bridge.run("print('hello')\n40 + 2", "c-basic")
+    assert "hello" in stdout_text(msgs, "c-basic")
+    result = [o for o in outputs(msgs, "c-basic") if o["output_type"] == "execute_result"]
+    assert result and result[0]["data"]["text/plain"] == "42"
+    count = next(m for m in msgs if m["type"] == "execute_input")["execution_count"]
+    assert isinstance(count, int) and count >= 1
+
+
+def test_execute_reply_reports_status_and_times(bridge):
+    msgs = bridge.run("import time; time.sleep(0.3)", "c-time")
+    started = next(m for m in msgs if m["type"] == "execute_input")
+    reply = msgs[-1]
+    assert reply["status"] == "ok"
+    assert started["date"] and reply["date"] and reply["date"] > started["date"]
+
+
+def test_error_output_and_reply_status(bridge):
+    msgs = bridge.run("undefined_variable_xyz", "c-err")
+    errors = [o for o in outputs(msgs, "c-err") if o["output_type"] == "error"]
+    assert errors and errors[0]["ename"] == "NameError"
+    assert msgs[-1]["status"] == "error"
+
+
+def test_cells_queued_after_error_are_aborted_not_run(bridge):
+    bridge.send(action="execute", code="raise ValueError('stop')", cell_id="q1")
+    bridge.send(action="execute", code="print('should not run')", cell_id="q2")
+    msgs = bridge.collect_until(lambda m: m.get("type") == "execute_reply" and m.get("cell_id") == "q2")
+    assert not stdout_text(msgs, "q2")
+    assert msgs[-1]["status"] == "aborted"
+
+
+def test_clear_output_is_forwarded(bridge):
+    msgs = bridge.run("from IPython.display import clear_output\nprint('old')\nclear_output(wait=True)\nprint('new')", "c-clear")
+    clears = [m for m in msgs if m["type"] == "clear_output"]
+    assert clears and clears[0]["cell_id"] == "c-clear" and clears[0]["wait"] is True
+
+
+def test_display_updates_are_forwarded(bridge):
+    msgs = bridge.run("from IPython.display import display\nh = display('a', display_id='disp-1')\nh.update('b')", "c-disp")
+    shown = [o for o in outputs(msgs, "c-disp") if o["output_type"] == "display_data"]
+    assert shown and shown[0]["transient"]["display_id"] == "disp-1"
+    update = next(m for m in msgs if m["type"] == "update_display")
+    assert update["display_id"] == "disp-1"
+    assert update["output"]["data"]["text/plain"] == "'b'"
+
+
+def test_rich_mime_bundles_are_passed_through(bridge):
+    code = "from IPython.display import Markdown, Latex, HTML, display\ndisplay(Markdown('**b**'))\ndisplay(Latex('$x$'))\nHTML('<b>h</b>')"
+    mimes = {k for o in outputs(bridge.run(code, "c-mime"), "c-mime") for k in o.get("data", {})}
+    assert {"text/markdown", "text/latex", "text/html"} <= mimes
+
+
+def test_magics_and_shell_commands(bridge):
+    msgs = bridge.run("%time x = 1\n!echo shell-ok", "c-magic")
+    text = stdout_text(msgs, "c-magic")
+    assert "shell-ok" in text and "Wall time" in text
+
+
+def test_complete_while_cell_runs(bridge):
+    bridge.send(action="execute", code="import time; time.sleep(1.5)", cell_id="c-busy")
+    bridge.send(action="complete", code="pri", cursor_pos=3, request_id="r1")
+    reply = bridge.wait(lambda m: m["type"] == "complete_reply", timeout=10)
+    assert reply and reply["request_id"] == "r1" and "print" in reply["matches"]
+    bridge.wait(lambda m: m.get("type") == "execute_reply" and m.get("cell_id") == "c-busy")
+
+
+def test_inspect_returns_sections(bridge):
+    bridge.run("value_to_inspect = [1, 2, 3]", "c-insp")
+    bridge.send(action="inspect", code="value_to_inspect", cursor_pos=16, request_id="i1")
+    reply = bridge.wait(lambda m: m["type"] == "inspect_reply", timeout=10)
+    assert reply and reply["request_id"] == "i1" and reply["found"] is True
+    assert "list" in json.dumps(reply["sections"])
+
+
+def test_stdin_input_request_reply(bridge):
+    bridge.send(action="execute", code="name = input('Name: ')\nprint('hi', name)", cell_id="c-in")
+    req = bridge.wait(lambda m: m["type"] == "input_request", timeout=10)
+    assert req and "Name:" in req["prompt"] and req["cell_id"] == "c-in"
+    bridge.send(action="input_reply", request_id=req["request_id"], value="Ada")
+    msgs = bridge.collect_until(lambda m: m.get("type") == "execute_reply" and m.get("cell_id") == "c-in")
+    assert "hi Ada" in stdout_text(msgs, "c-in")
+
+
+def test_interrupt_stops_running_cell_quickly(bridge):
+    bridge.send(action="execute", code="import time\nfor _ in range(100): time.sleep(0.2)", cell_id="c-int")
+    assert bridge.wait(lambda m: m.get("type") == "execute_input" and m.get("cell_id") == "c-int")
+    t0 = time.time()
+    bridge.send(action="interrupt")
+    msgs = bridge.collect_until(lambda m: m.get("type") == "execute_reply" and m.get("cell_id") == "c-int", timeout=15)
+    assert any(o.get("ename") == "KeyboardInterrupt" for o in outputs(msgs, "c-int"))
+    assert time.time() - t0 < 5
+
+
+def test_unicode_output_round_trips(bridge):
+    msgs = bridge.run("print('μs ✓ 日本')", "c-uni")
+    assert "μs ✓ 日本" in stdout_text(msgs, "c-uni")
+
+
+def test_restart_clears_state(bridge):
+    bridge.run("restart_marker = 1", "c-pre")
+    bridge.send(action="restart")
+    assert bridge.wait(lambda m: m["type"] in ("restarted", "error"), timeout=60)["type"] == "restarted"
+    msgs = bridge.run("restart_marker", "c-post")
+    assert any(o.get("ename") == "NameError" for o in outputs(msgs, "c-post"))
+
+
+def test_connect_to_existing_kernel_and_disconnect_leaves_it_running(tmp_path):
+    from jupyter_client import KernelManager
+
+    km = KernelManager(kernel_name="python3", connection_file=str(tmp_path / "kernel.json"))
+    km.start_kernel()
+    try:
+        b = Bridge()
+        assert b.next()["type"] == "ready"
+        b.send(action="connect", connection_file=km.connection_file)
+        connected = b.wait(lambda m: m["type"] in ("kernel_connected", "error"), timeout=60)
+        assert connected and connected["type"] == "kernel_connected", connected
+        assert "connected-ok" in stdout_text(b.run("print('connected-ok')", "c-conn"), "c-conn")
+        b.close()
+        time.sleep(1)
+        assert km.is_alive(), "disconnecting must not shut down a kernel we did not start"
+    finally:
+        km.shutdown_kernel(now=True)
+
+
+def test_bad_commands_report_errors_without_crashing(bridge):
+    bridge.proc.stdin.write("not json\n")
+    bridge.proc.stdin.flush()
+    assert bridge.wait(lambda m: m["type"] == "error" and "Invalid JSON" in m["error"], timeout=5)
+    bridge.send(action="execute", code="1")
+    assert bridge.wait(lambda m: m["type"] == "error" and "cell_id" in m["error"], timeout=5)
+    bridge.send(action="ping")
+    assert bridge.wait(lambda m: m["type"] == "pong", timeout=5)

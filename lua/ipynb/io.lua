@@ -1,4 +1,7 @@
--- ipynb/io.lua - File I/O (ipynb ↔ jupytext conversion)
+-- ipynb/io.lua - File I/O (ipynb ↔ facade conversion)
+-- Files are written exactly the way Jupyter's nbformat writes them (sorted keys,
+-- one-space indent, multi-line strings split into lists) so saving an untouched
+-- notebook changes nothing and saved notebooks diff cleanly in git.
 
 local M = {}
 
@@ -14,6 +17,207 @@ local function ensure_dict(t)
   end
   return t
 end
+
+---Convert JSON null to nil
+---@param v any
+---@return any
+local function denull(v)
+  if v == vim.NIL then
+    return nil
+  end
+  return v
+end
+
+--------------------------------------------------------------------------------
+-- Python-compatible line splitting and JSON encoding
+--------------------------------------------------------------------------------
+
+-- Single-byte line boundaries recognised by Python's str.splitlines()
+local LINE_BREAK_BYTES = { [10] = true, [11] = true, [12] = true, [13] = true, [28] = true, [29] = true, [30] = true }
+
+---Split a string like Python's str.splitlines(True) (line endings kept)
+---@param s string
+---@return string[]
+function M.splitlines(s)
+  local lines = {}
+  local start, i, n = 1, 1, #s
+  while i <= n do
+    local b = s:byte(i)
+    local stop
+    if b == 13 and s:byte(i + 1) == 10 then
+      stop = i + 1
+    elseif LINE_BREAK_BYTES[b] then
+      stop = i
+    elseif b == 0xC2 and s:byte(i + 1) == 0x85 then -- U+0085 NEXT LINE
+      stop = i + 1
+    elseif b == 0xE2 and s:byte(i + 1) == 0x80 and (s:byte(i + 2) == 0xA8 or s:byte(i + 2) == 0xA9) then
+      stop = i + 2 -- U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR
+    end
+    if stop then
+      lines[#lines + 1] = s:sub(start, stop)
+      start = stop + 1
+      i = stop + 1
+    else
+      i = i + 1
+    end
+  end
+  if start <= n then
+    lines[#lines + 1] = s:sub(start)
+  end
+  return lines
+end
+
+local JSON_ESCAPES = { ['"'] = '\\"', ['\\'] = '\\\\', ['\b'] = '\\b', ['\f'] = '\\f', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
+
+---Encode a string like Python's json.dumps(ensure_ascii=False)
+---@param s string
+---@return string
+local function encode_string(s)
+  return '"' .. s:gsub('[%c"\\]', function(c)
+    local b = c:byte()
+    if JSON_ESCAPES[c] then
+      return JSON_ESCAPES[c]
+    elseif b < 32 then
+      return string.format('\\u%04x', b)
+    end
+    return c -- DEL (127) is not escaped by Python
+  end) .. '"'
+end
+
+---Encode a number like Python's json.dumps (shortest round-trip repr)
+---@param n number
+---@return string
+local function encode_number(n)
+  if n ~= n or n == math.huge or n == -math.huge then
+    return n ~= n and 'NaN' or (n > 0 and 'Infinity' or '-Infinity')
+  end
+  if n == math.floor(n) and math.abs(n) < 2 ^ 53 then
+    return string.format('%d', n)
+  end
+  for precision = 15, 17 do
+    local s = string.format('%.' .. precision .. 'g', n)
+    if tonumber(s) == n then
+      return s
+    end
+  end
+  return string.format('%.17g', n)
+end
+
+---Byte-wise string comparison (Python sorts keys by code point; UTF-8 byte
+---order matches, while Lua's `<` uses the locale's collation)
+---@param a string
+---@param b string
+---@return boolean
+local function bytes_less(a, b)
+  local n = math.min(#a, #b)
+  for i = 1, n do
+    local x, y = a:byte(i), b:byte(i)
+    if x ~= y then
+      return x < y
+    end
+  end
+  return #a < #b
+end
+
+---Encode a Lua value as nbformat-style JSON (sort_keys=True, indent=1)
+---@param value any
+---@param indent string
+---@param out string[]
+local function encode_value(value, indent, out)
+  local t = type(value)
+  if value == nil or value == vim.NIL then
+    out[#out + 1] = 'null'
+  elseif t == 'boolean' then
+    out[#out + 1] = tostring(value)
+  elseif t == 'number' then
+    out[#out + 1] = encode_number(value)
+  elseif t == 'string' then
+    out[#out + 1] = encode_string(value)
+  elseif t == 'table' then
+    local inner = indent .. ' '
+    if next(value) == nil then
+      out[#out + 1] = getmetatable(value) == getmetatable(vim.empty_dict()) and '{}' or '[]'
+    elseif vim.islist(value) then
+      out[#out + 1] = '[\n'
+      for i, item in ipairs(value) do
+        out[#out + 1] = inner
+        encode_value(item, inner, out)
+        out[#out + 1] = i < #value and ',\n' or '\n'
+      end
+      out[#out + 1] = indent .. ']'
+    else
+      local keys = {}
+      for k in pairs(value) do
+        keys[#keys + 1] = tostring(k)
+      end
+      table.sort(keys, bytes_less)
+      out[#out + 1] = '{\n'
+      for i, k in ipairs(keys) do
+        local v = value[k]
+        if v == nil then
+          v = value[tonumber(k)]
+        end
+        out[#out + 1] = inner .. encode_string(k) .. ': '
+        encode_value(v, inner, out)
+        out[#out + 1] = i < #keys and ',\n' or '\n'
+      end
+      out[#out + 1] = indent .. '}'
+    end
+  else
+    error('cannot encode ' .. t .. ' as JSON')
+  end
+end
+
+---Encode a notebook table exactly like nbformat.writes()
+---@param value table
+---@return string
+function M.encode_json(value)
+  local out = {}
+  encode_value(value, '', out)
+  return table.concat(out)
+end
+
+---Split text mime values in a bundle into line lists (nbformat's _split_mimebundle)
+---@param data table|nil
+---@return table|nil
+local function split_mimebundle(data)
+  if type(data) ~= 'table' then
+    return data
+  end
+  local result = vim.deepcopy(data)
+  for key, value in pairs(result) do
+    if type(value) == 'string' and (key:sub(1, 5) == 'text/' or key == 'application/javascript' or key == 'image/svg+xml') then
+      result[key] = M.splitlines(value)
+    end
+  end
+  return result
+end
+
+---Prepare outputs for writing (nbformat split_lines for outputs)
+---@param outputs table[]|nil
+---@return table[]
+local function split_outputs(outputs)
+  local result = {}
+  for i, output in ipairs(outputs or {}) do
+    local copy = vim.deepcopy(output)
+    copy.transient = nil -- runtime-only (display ids); nbformat strips it too
+    if copy.output_type == 'stream' and type(copy.text) == 'string' then
+      copy.text = M.splitlines(copy.text)
+    elseif copy.output_type == 'execute_result' or copy.output_type == 'display_data' then
+      copy.data = split_mimebundle(copy.data)
+      copy.metadata = ensure_dict(copy.metadata)
+    end
+    result[i] = copy
+  end
+  return result
+end
+
+--------------------------------------------------------------------------------
+-- Notebook files
+--------------------------------------------------------------------------------
+
+---@class NotebookFileFormat
+---@field crlf boolean Original file used CRLF line endings
 
 ---Create default metadata for a new notebook
 ---@param kernel_name string|nil Kernel name (default: "python3")
@@ -53,96 +257,67 @@ function M.create_empty_notebook(kernel_name)
 end
 
 ---Parse a .ipynb JSON file into cells
----Auto-upgrades to nbformat 4.5 and ensures all loaded cells have unique IDs
----(per JEP 62), repairing missing or duplicate IDs on read.
+---Auto-upgrades to nbformat 4.5 and ensures all loaded cells have unique, valid
+---IDs (per JEP 62), repairing missing, duplicate or malformed IDs on read.
 ---@param path string Path to .ipynb file
----@return Cell[], table metadata, table<string, boolean> cell_ids
+---@return Cell[], table metadata, table<string, boolean> cell_ids, NotebookFileFormat format
 function M.read_ipynb(path)
-  local content = vim.fn.readfile(path)
-  local json_str = table.concat(content, '\n')
+  local f, open_err = io.open(path, 'rb')
+  if not f then
+    error('Failed to read notebook: ' .. tostring(open_err))
+  end
+  local json_str = f:read('*a')
+  f:close()
 
   local ok, notebook = pcall(vim.json.decode, json_str)
-  if not ok then
+  if not ok or type(notebook) ~= 'table' then
     error('Failed to parse notebook JSON: ' .. tostring(notebook))
   end
 
   -- Assign IDs against a live "already used" set so malformed notebooks with
   -- duplicate IDs are repaired during load. The first valid occurrence wins.
+  -- IDs must match the nbformat pattern: they are also used in cache file names.
   local existing_ids = {}
   local cells = {}
   for _, nb_cell in ipairs(notebook.cells or {}) do
-    -- Source can be string or array of strings
-    -- Trailing \n on last element means trailing blank line - preserve it
-    local source = nb_cell.source
+    local source = denull(nb_cell.source) or ''
     if type(source) == 'table' then
       source = table.concat(source, '')
     end
 
-    -- Preserve the first valid cell ID, otherwise repair by generating a new one.
     local id = nb_cell.id
-    if type(id) ~= 'string' or id == '' or existing_ids[id] then
+    if not state_mod.is_valid_cell_id(id) or existing_ids[id] then
       id = state_mod.generate_cell_id(existing_ids)
     end
     existing_ids[id] = true
 
-    local cell = {
+    table.insert(cells, {
       id = id,
       type = nb_cell.cell_type or 'code',
       source = source,
-      metadata = nb_cell.metadata or {},
-      outputs = nb_cell.outputs,
-      execution_count = nb_cell.execution_count,
-    }
-    table.insert(cells, cell)
+      metadata = denull(nb_cell.metadata) or {},
+      outputs = denull(nb_cell.outputs),
+      execution_count = denull(nb_cell.execution_count),
+      attachments = denull(nb_cell.attachments),
+    })
   end
 
-  -- Extract notebook metadata, preserving ALL fields (Colab, Kaggle, widgets, etc.)
-  local default = M.default_metadata()
-  local nb_meta = notebook.metadata or {}
-
-  -- Start with all original metadata, then ensure required fields have defaults
-  local metadata = vim.tbl_deep_extend('keep', nb_meta, {
-    kernelspec = default.kernelspec,
-    language_info = default.language_info,
-  })
+  -- Keep ALL notebook metadata (Colab, Kaggle, Databricks, widgets, etc.)
+  local metadata = vim.deepcopy(denull(notebook.metadata) or {})
 
   -- Auto-upgrade to nbformat 4.5 (cell IDs required per JEP 62)
-  metadata.nbformat = notebook.nbformat or default.nbformat
+  metadata.nbformat = notebook.nbformat or 4
   metadata.nbformat_minor = math.max(notebook.nbformat_minor or 0, 5)
 
-  return cells, metadata, existing_ids
-end
-
----Split source string into array of lines (matches nbformat/splitlines behavior)
----@param source string
----@return string[]
-local function split_source(source)
-  if source == '' then
-    return {}
-  end
-
-  local source_lines = {}
-  local lines = vim.split(source, '\n', { plain = true })
-
-  for i, line in ipairs(lines) do
-    if i < #lines then
-      -- Not the last element - add newline back
-      table.insert(source_lines, line .. '\n')
-    elseif line ~= '' then
-      -- Last element: only include if non-empty
-      -- (empty last element means source ended with \n, already captured above)
-      table.insert(source_lines, line)
-    end
-  end
-
-  return source_lines
+  return cells, metadata, existing_ids, { crlf = json_str:find('\r\n', 1, true) ~= nil }
 end
 
 ---Write cells back to .ipynb format
 ---@param path string Path to write to
 ---@param cells Cell[]
 ---@param metadata table|nil Notebook metadata
-function M.write_ipynb(path, cells, metadata)
+---@param format NotebookFileFormat|nil Original file format to preserve
+function M.write_ipynb(path, cells, metadata, format)
   -- Collect existing IDs for collision avoidance (safety net for missing IDs)
   local existing_ids = {}
   for _, cell in ipairs(cells) do
@@ -153,9 +328,6 @@ function M.write_ipynb(path, cells, metadata)
 
   local nb_cells = {}
   for _, cell in ipairs(cells) do
-    local source_lines = split_source(cell.source)
-
-    -- Use existing ID, or generate if missing (safety net)
     local id = cell.id
     if not id then
       id = state_mod.generate_cell_id(existing_ids)
@@ -165,47 +337,88 @@ function M.write_ipynb(path, cells, metadata)
     local nb_cell = {
       id = id,
       cell_type = cell.type,
-      source = source_lines,
+      source = M.splitlines(cell.source or ''),
       metadata = ensure_dict(cell.metadata),
     }
 
     if cell.type == 'code' then
-      nb_cell.outputs = cell.outputs or {}
-      nb_cell.execution_count = cell.execution_count
+      nb_cell.outputs = split_outputs(cell.outputs)
+      nb_cell.execution_count = cell.execution_count or vim.NIL
+    elseif cell.attachments then
+      local attachments = {}
+      for name, bundle in pairs(cell.attachments) do
+        attachments[name] = split_mimebundle(bundle)
+      end
+      nb_cell.attachments = ensure_dict(attachments)
     end
 
     table.insert(nb_cells, nb_cell)
   end
 
-  local default = M.default_metadata()
-
-  -- Preserve ALL metadata fields (Colab, Kaggle, widgets, custom fields, etc.)
   -- Only nbformat/nbformat_minor are top-level; everything else goes in metadata
   local nb_metadata = {}
-  if metadata then
-    for k, v in pairs(metadata) do
-      if k ~= 'nbformat' and k ~= 'nbformat_minor' then
-        nb_metadata[k] = v
-      end
+  for k, v in pairs(metadata or {}) do
+    if k ~= 'nbformat' and k ~= 'nbformat_minor' then
+      nb_metadata[k] = v
     end
   end
-
-  -- Ensure required fields have defaults
-  nb_metadata.kernelspec = nb_metadata.kernelspec or default.kernelspec
-  nb_metadata.language_info = nb_metadata.language_info or default.language_info
 
   local notebook = {
     cells = nb_cells,
     metadata = ensure_dict(nb_metadata),
-    nbformat = metadata and metadata.nbformat or default.nbformat,
-    nbformat_minor = metadata and metadata.nbformat_minor or default.nbformat_minor,
+    nbformat = metadata and metadata.nbformat or 4,
+    nbformat_minor = metadata and metadata.nbformat_minor or 5,
   }
 
-  local json_str = vim.json.encode(notebook)
-  -- Pretty format JSON for readability
-  json_str = M.pretty_json(json_str)
+  local text = M.encode_json(notebook) .. '\n'
+  if format and format.crlf then
+    text = text:gsub('\n', '\r\n')
+  end
 
-  vim.fn.writefile(vim.split(json_str, '\n'), path)
+  -- Write to a temp file first so a failed write never truncates the notebook
+  local tmp = path .. '.ipynb-nvim-tmp'
+  local f, err = io.open(tmp, 'wb')
+  if not f then
+    error('Failed to write notebook: ' .. tostring(err))
+  end
+  f:write(text)
+  f:close()
+  local renamed, rename_err = vim.uv.fs_rename(tmp, path)
+  if not renamed then
+    os.remove(tmp)
+    error('Failed to write notebook: ' .. tostring(rename_err))
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Facade format
+--------------------------------------------------------------------------------
+
+-- Source lines that look like a cell marker (optionally already escaped with
+-- leading backslashes) get one extra backslash in the facade, so cell content
+-- can never be mistaken for a cell boundary.
+local MARKER_LIKE = '^\\*# <</?ipynb_nvim'
+
+---Escape source lines for display in the facade buffer
+---@param lines string[]
+---@return string[]
+function M.escape_lines(lines)
+  local result = {}
+  for i, line in ipairs(lines) do
+    result[i] = line:find(MARKER_LIKE) and ('\\' .. line) or line
+  end
+  return result
+end
+
+---Reverse escape_lines (facade lines back to source lines)
+---@param lines string[]
+---@return string[]
+function M.unescape_lines(lines)
+  local result = {}
+  for i, line in ipairs(lines) do
+    result[i] = (line:sub(1, 1) == '\\' and line:find(MARKER_LIKE)) and line:sub(2) or line
+  end
+  return result
 end
 
 ---Convert cells to facade format with explicit start/end delimiters
@@ -222,16 +435,8 @@ function M.cells_to_jupytext(cells)
       table.insert(lines, '')
     end
 
-    -- Cell start marker
     table.insert(lines, '# <<ipynb_nvim:' .. cell.type .. '>>')
-
-    -- Cell content (no prefix needed - we have explicit end markers)
-    local source_lines = vim.split(cell.source, '\n', { plain = true })
-    for _, line in ipairs(source_lines) do
-      table.insert(lines, line)
-    end
-
-    -- Cell end marker
+    vim.list_extend(lines, M.escape_lines(vim.split(cell.source, '\n', { plain = true })))
     table.insert(lines, '# <</ipynb_nvim>>')
   end
 
@@ -242,8 +447,6 @@ function M.cells_to_jupytext(cells)
 end
 
 ---Parse facade format back into cells
----Custom format: # <<ipynb_nvim:code>>, # <<ipynb_nvim:markdown>>, # <<ipynb_nvim:raw>>
----End marker: # <</ipynb_nvim>>
 ---@param lines string[]
 ---@return Cell[]
 function M.jupytext_to_cells(lines)
@@ -254,23 +457,16 @@ function M.jupytext_to_cells(lines)
   local function save_current_cell()
     if current_cell then
       -- Join content lines - trailing newline represents a blank last line
-      current_cell.source = table.concat(content_lines, '\n')
+      current_cell.source = table.concat(M.unescape_lines(content_lines), '\n')
       table.insert(cells, current_cell)
     end
   end
 
   for _, line in ipairs(lines) do
-    -- Check for cell start marker: # <<ipynb_nvim:type>>
     local cell_type = line:match('^# <<ipynb_nvim:(%w+)>>$')
 
-    -- Check for cell end marker: # <</ipynb_nvim>>
-    local is_end = line:match('^# <</ipynb_nvim>>$')
-
     if cell_type then
-      -- Save previous cell if any
       save_current_cell()
-
-      -- Start new cell
       current_cell = {
         type = cell_type,
         source = '',
@@ -278,8 +474,7 @@ function M.jupytext_to_cells(lines)
         outputs = cell_type == 'code' and {} or nil,
       }
       content_lines = {}
-    elseif is_end then
-      -- End current cell
+    elseif line == '# <</ipynb_nvim>>' then
       save_current_cell()
       current_cell = nil
       content_lines = {}
@@ -294,56 +489,44 @@ function M.jupytext_to_cells(lines)
   return cells
 end
 
+--------------------------------------------------------------------------------
+-- Buffer integration
+--------------------------------------------------------------------------------
+
 ---Open a notebook file (or create new if doesn't exist)
 ---@param buf number Buffer to populate
 ---@param path string Path to .ipynb file
 function M.open_notebook(buf, path)
-  local cells, metadata, cell_ids
+  local cells, metadata, cell_ids, format
 
-  -- Check if file exists
   if vim.fn.filereadable(path) == 1 then
-    -- Read existing notebook
-    cells, metadata, cell_ids = M.read_ipynb(path)
+    cells, metadata, cell_ids, format = M.read_ipynb(path)
   else
-    -- Create new empty notebook
     cells, metadata, cell_ids = M.create_empty_notebook()
     vim.notify('New notebook: ' .. vim.fn.fnamemodify(path, ':t'), vim.log.levels.INFO)
   end
 
-  -- Create state
   local state = state_mod.create(path)
   state.cells = cells
   state.metadata = metadata
   state.cell_ids = cell_ids
+  state.file_format = format
 
-  -- Create facade buffer
-  local facade = require('ipynb.facade')
-  facade.create(state, buf)
-
-  -- Register state
+  require('ipynb.facade').create(state, buf)
   state_mod.register(state)
 
-  -- Setup cells and visuals
-  local cells_mod = require('ipynb.cells')
-  cells_mod.place_markers(state)
+  require('ipynb.cells').place_markers(state)
 
   local visuals = require('ipynb.visuals')
   visuals.render_all(state)
-
   -- Setup active cell tracking (throttled, once per buffer)
   visuals.setup_active_tracking(state)
 
   -- Render existing outputs (including images)
-  local output = require('ipynb.output')
-  output.render_all(state)
+  require('ipynb.output').render_all(state)
 
-  -- Setup keymaps
-  local keymaps = require('ipynb.keymaps')
-  keymaps.setup_facade_keymaps(state)
-
-  -- Setup buffer-local commands
-  local commands = require('ipynb.commands')
-  commands.setup_buffer(state)
+  require('ipynb.keymaps').setup_facade_keymaps(state)
+  require('ipynb.commands').setup_buffer(state)
 end
 
 ---Save a notebook file
@@ -358,68 +541,18 @@ function M.save_notebook(buf, path)
 
   path = path or state.source_path
 
-  -- Sync cells from facade buffer
   local cells_mod = require('ipynb.cells')
   cells_mod.sync_cells_from_facade(state)
-  cells_mod.place_markers(state)  -- Refresh extmarks after sync
+  cells_mod.place_markers(state) -- Refresh extmarks after sync
 
-  -- Write to file
-  M.write_ipynb(path, state.cells, state.metadata)
-
-  -- Mark buffer as saved
-  vim.bo[buf].modified = false
-
-  vim.notify('Saved notebook: ' .. path, vim.log.levels.INFO)
-end
-
----Simple JSON pretty printer
----@param json_str string
----@return string
-function M.pretty_json(json_str)
-  local indent = 0
-  local result = {}
-  local in_string = false
-  local escape_next = false
-
-  for i = 1, #json_str do
-    local char = json_str:sub(i, i)
-
-    if escape_next then
-      table.insert(result, char)
-      escape_next = false
-    elseif char == '\\' and in_string then
-      table.insert(result, char)
-      escape_next = true
-    elseif char == '"' then
-      table.insert(result, char)
-      in_string = not in_string
-    elseif not in_string then
-      if char == '{' or char == '[' then
-        indent = indent + 1
-        table.insert(result, char)
-        table.insert(result, '\n')
-        table.insert(result, string.rep(' ', indent * 2))
-      elseif char == '}' or char == ']' then
-        indent = indent - 1
-        table.insert(result, '\n')
-        table.insert(result, string.rep(' ', indent * 2))
-        table.insert(result, char)
-      elseif char == ',' then
-        table.insert(result, char)
-        table.insert(result, '\n')
-        table.insert(result, string.rep(' ', indent * 2))
-      elseif char == ':' then
-        table.insert(result, char)
-        table.insert(result, ' ')
-      elseif char ~= ' ' and char ~= '\n' and char ~= '\t' then
-        table.insert(result, char)
-      end
-    else
-      table.insert(result, char)
-    end
+  local ok, err = pcall(M.write_ipynb, path, state.cells, state.metadata, state.file_format)
+  if not ok then
+    vim.notify(tostring(err), vim.log.levels.ERROR)
+    return
   end
 
-  return table.concat(result)
+  vim.bo[buf].modified = false
+  vim.notify('Saved notebook: ' .. path, vim.log.levels.INFO)
 end
 
 return M

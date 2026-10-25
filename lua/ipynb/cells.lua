@@ -127,6 +127,11 @@ function M.get_content_range(state, cell_idx)
   return start_line + 1, end_line - 1
 end
 
+-- Per-cell execution data that survives re-parsing the facade
+local CODE_CELL_FIELDS = {
+  'outputs', 'execution_count', 'execution_state', 'execution_time', '_stream_state', 'output_extmark',
+}
+
 ---Sync cells from facade buffer back to state
 ---@param state NotebookState
 function M.sync_cells_from_facade(state)
@@ -147,64 +152,41 @@ function M.sync_cells_from_facade(state)
     table.insert(old_cells_by_source[key], cell)
   end
 
-  -- Store execution data by cell ID so they persist even when content changes
-  -- This is critical for undo - we want outputs to survive content changes
-  local cell_data_by_id = {}
-  for _, cell in ipairs(state.cells) do
-    if cell.id and cell.type == 'code' then
-      cell_data_by_id[cell.id] = {
-        outputs = cell.outputs,
-        execution_count = cell.execution_count,
-        namespace_state = cell.namespace_state,
-        execution_state = cell.execution_state,
-        stream_state = cell._stream_state,
-      }
+  ---Carry identity and execution data from an old cell to its re-parsed copy
+  local function inherit(new_cell, old_cell)
+    new_cell.id = old_cell.id
+    new_cell.metadata = old_cell.metadata
+    new_cell.edit_buf = old_cell.edit_buf
+    if new_cell.type == 'code' and old_cell.type == 'code' then
+      for _, field in ipairs(CODE_CELL_FIELDS) do
+        new_cell[field] = old_cell[field]
+      end
+    elseif new_cell.type == 'markdown' then
+      new_cell.attachments = old_cell.attachments
     end
   end
 
-  -- Preserve id, metadata, outputs, edit buffers, and extmarks from matching old cells
+  -- Pass 1: exact content matches (FIFO for duplicates)
+  local used, matched = {}, {}
   for i, new_cell in ipairs(new_cells) do
-    local key = new_cell.type .. ':' .. new_cell.source
-    local matches = old_cells_by_source[key]
+    local matches = old_cells_by_source[new_cell.type .. ':' .. new_cell.source]
+    local old_cell = matches and table.remove(matches, 1)
+    if old_cell then
+      used[old_cell], matched[i] = true, true
+      inherit(new_cell, old_cell)
+    end
+  end
 
-    if matches and #matches > 0 then
-      -- Take first matching cell (handles duplicate content by FIFO)
-      local old_cell = table.remove(matches, 1)
-      new_cell.id = old_cell.id  -- Preserve unique ID
-      new_cell.metadata = old_cell.metadata
-      new_cell.edit_buf = old_cell.edit_buf
-      if new_cell.type == 'code' and old_cell.type == 'code' then
-        new_cell.outputs = old_cell.outputs
-        new_cell.execution_count = old_cell.execution_count
-        new_cell.namespace_state = old_cell.namespace_state
-        new_cell.execution_state = old_cell.execution_state
-        new_cell._stream_state = old_cell._stream_state
-        new_cell.output_extmark = old_cell.output_extmark
-      end
-    else
-      -- No content match - try to preserve identity by position
-      -- This helps with undo when content changes
+  -- Pass 2: same position and type, so identity survives edits and undo
+  for i, new_cell in ipairs(new_cells) do
+    if not matched[i] then
       local old_cell = state.cells[i]
-      if old_cell and old_cell.id and old_cell.type == new_cell.type then
-        -- Same position, same type - preserve identity
-        new_cell.id = old_cell.id
-        new_cell.edit_buf = old_cell.edit_buf
-        new_cell.metadata = old_cell.metadata
-        -- Preserve execution data if this is a code cell
-        if new_cell.type == 'code' then
-          local data = cell_data_by_id[old_cell.id]
-          if data then
-            new_cell.outputs = data.outputs
-            new_cell.execution_count = data.execution_count
-            new_cell.namespace_state = data.namespace_state
-            new_cell.execution_state = data.execution_state
-            new_cell._stream_state = data.stream_state
-          end
-          new_cell.output_extmark = old_cell.output_extmark
-        end
+      if old_cell and old_cell.id and old_cell.type == new_cell.type and not used[old_cell] then
+        used[old_cell] = true
+        inherit(new_cell, old_cell)
       else
-        -- New cell with no match - generate a new ID
-        new_cell.id = state_mod.generate_cell_id()
+        new_cell.id = state_mod.generate_cell_id(state.cell_ids)
+        state.cell_ids[new_cell.id] = true
       end
     end
   end

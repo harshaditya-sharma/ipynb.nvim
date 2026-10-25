@@ -129,7 +129,9 @@ function M.setup_edit_diagnostics(state)
 
   -- Trigger initial diagnostic refresh
   vim.schedule(function()
-    vim.api.nvim_exec_autocmds('DiagnosticChanged', { buffer = state.shadow_buf })
+    if state.shadow_buf and vim.api.nvim_buf_is_valid(state.shadow_buf) then
+      vim.api.nvim_exec_autocmds('DiagnosticChanged', { buffer = state.shadow_buf })
+    end
   end)
 end
 

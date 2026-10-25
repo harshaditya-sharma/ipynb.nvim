@@ -15,6 +15,29 @@ local function set_facade_lines(buf, start_line, end_line, lines)
   end
 end
 
+---Start notebook highlighting, retrying while the parser is still being
+---compiled (first run): the notebook itself works without it.
+---@param buf number
+function M.start_treesitter(buf)
+  if pcall(vim.treesitter.start, buf, 'ipynb') then
+    return
+  end
+  local timer = vim.uv.new_timer()
+  if not timer then
+    return
+  end
+  local tries = 0
+  timer:start(500, 1000, vim.schedule_wrap(function()
+    tries = tries + 1
+    local done = not vim.api.nvim_buf_is_valid(buf) or tries > 120
+      or pcall(vim.treesitter.start, buf, 'ipynb')
+    if done and not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+  end))
+end
+
 ---Create and configure the facade buffer
 ---@param state NotebookState
 ---@param buf number|nil Existing buffer to use, or nil to create new
@@ -66,7 +89,7 @@ function M.create(state, buf)
 
   -- Start treesitter highlighting for the notebook grammar
   -- This enables syntax highlighting via our custom parser and injection queries
-  vim.treesitter.start(buf, 'ipynb')
+  M.start_treesitter(buf)
 
   -- Create shadow buffer for LSP (also installs global LSP proxy)
   local lsp_mod = require('ipynb.lsp')

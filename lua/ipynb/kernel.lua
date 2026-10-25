@@ -77,19 +77,60 @@ local function close_input_prompt(state)
   end
 end
 
----Update a cell field and re-render visuals
+---Re-render cell borders once per event-loop tick, however many kernel
+---messages arrive in between (a busy cell can produce hundreds).
 ---@param state NotebookState
----@param cell_idx number
----@param field string
----@param value any
-local function update_cell_field(state, cell_idx, field, value)
+local function request_render(state)
+  if state._render_scheduled then
+    return
+  end
+  state._render_scheduled = true
   vim.schedule(function()
-    if state and state.cells and state.cells[cell_idx] then
-      state.cells[cell_idx][field] = value
+    state._render_scheduled = false
+    if state.facade_buf and vim.api.nvim_buf_is_valid(state.facade_buf) then
       require("ipynb.visuals").render_all(state)
     end
   end)
 end
+
+---Re-render one cell's outputs on the next tick (coalesced per cell)
+---@param state NotebookState
+---@param cell Cell
+local function request_output_render(state, cell)
+  state._dirty_outputs = state._dirty_outputs or {}
+  if next(state._dirty_outputs) == nil then
+    vim.schedule(function()
+      local dirty = state._dirty_outputs
+      state._dirty_outputs = {}
+      if state.facade_buf and not vim.api.nvim_buf_is_valid(state.facade_buf) then
+        return -- notebook closed meanwhile
+      end
+      local output_mod = require("ipynb.output")
+      for idx, c in ipairs(state.cells or {}) do
+        if dirty[c] then
+          output_mod.render_outputs(state, idx)
+        end
+      end
+    end)
+  end
+  state._dirty_outputs[cell] = true
+end
+
+---Parse an ISO-8601 timestamp to seconds (only differences are used)
+---@param iso string|nil
+---@return number|nil
+local function iso_seconds(iso)
+  if type(iso) ~= "string" then
+    return nil
+  end
+  local y, mo, d, h, mi, sec = iso:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+%.?%d*)")
+  if not y then
+    return nil
+  end
+  local base = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d), hour = tonumber(h), min = tonumber(mi), sec = 0 })
+  return base + tonumber(sec)
+end
+M._iso_seconds = iso_seconds
 
 ---Rebuild the cell_id -> index cache for fast kernel message routing.
 ---@param state NotebookState
@@ -163,8 +204,8 @@ local function set_language(state, lang)
   local buf = state.facade_buf
   if buf and vim.api.nvim_buf_is_valid(buf) then
     vim.b[buf].ipynb_language = lang
-    vim.treesitter.stop(buf)
-    vim.treesitter.start(buf, 'ipynb')
+    pcall(vim.treesitter.stop, buf)
+    require('ipynb.facade').start_treesitter(buf)
   end
 
   -- Update shadow buffer filetype if language changed (triggers LSP reattach)
@@ -186,6 +227,42 @@ local function set_language(state, lang)
   end
 end
 
+---Language reported by a newly started/connected kernel
+---@param state NotebookState
+---@param language string|nil
+local function adopt_kernel_language(state, language)
+  if not language then
+    return
+  end
+  local lang = language:lower() -- treesitter needs lowercase
+  local current = state.metadata and state.metadata.language_info and state.metadata.language_info.name
+  if current ~= lang then
+    vim.schedule(function()
+      set_language(state, lang)
+      vim.notify('Language updated from kernel: ' .. lang, vim.log.levels.INFO)
+    end)
+  end
+end
+
+---Replace every output that shows `display_id` (IPython display handles)
+---@param state NotebookState
+---@param display_id string
+---@param output table
+local function update_display(state, display_id, output)
+  for _, cell in ipairs(state.cells or {}) do
+    for i, existing in ipairs(cell.outputs or {}) do
+      if type(existing.transient) == "table" and existing.transient.display_id == display_id then
+        local replacement = vim.deepcopy(output)
+        replacement.output_type = existing.output_type
+        replacement.execution_count = existing.execution_count
+        replacement.transient = existing.transient
+        cell.outputs[i] = replacement
+        request_output_render(state, cell)
+      end
+    end
+  end
+end
+
 ---Handle a message from the Python bridge
 ---@param state NotebookState
 ---@param msg table Parsed JSON message
@@ -201,48 +278,63 @@ local function handle_message(state, msg)
       vim.notify("Kernel bridge ready", vim.log.levels.INFO)
     end)
 
-  elseif msg_type == "kernel_started" then
+  elseif msg_type == "kernel_started" or msg_type == "kernel_connected" then
     kernel.connected = true
     kernel.kernel_id = msg.kernel_id
-    kernel.kernel_name = msg.kernel_name
+    kernel.kernel_name = msg.kernel_name or kernel.kernel_name
     kernel.execution_state = "idle"
-
-    -- Update language from kernelspec if provided and different
-    if msg.language then
-      local lang = msg.language:lower()  -- treesitter needs lowercase
-      local current_lang = state.metadata
-        and state.metadata.language_info
-        and state.metadata.language_info.name
-      if current_lang ~= lang then
-        vim.schedule(function()
-          set_language(state, lang)
-          vim.notify('Language updated from kernel: ' .. lang, vim.log.levels.INFO)
-        end)
-      end
-    end
-
+    adopt_kernel_language(state, msg.language)
     vim.schedule(function()
-      vim.notify("Kernel started: " .. msg.kernel_name, vim.log.levels.INFO)
-    end)
-
-  elseif msg_type == "kernel_connected" then
-    kernel.connected = true
-    kernel.execution_state = "idle"
-    vim.schedule(function()
-      vim.notify("Connected to kernel", vim.log.levels.INFO)
+      vim.notify(msg_type == "kernel_started" and ("Kernel started: " .. tostring(msg.kernel_name))
+        or "Connected to kernel", vim.log.levels.INFO)
     end)
 
   elseif msg_type == "status" then
     kernel.execution_state = msg.state or "idle"
-    local target_idx = resolve_message_cell(state, msg)
-    if target_idx then
-      update_cell_field(state, target_idx, "execution_state", msg.state)
+    local _, cell = resolve_message_cell(state, msg)
+    if cell and msg.state == "busy" and cell.execution_state == "queued" then
+      cell.execution_state = "busy"
+      request_render(state)
     end
     if msg.state == "idle" then
-      close_input_prompt(state)
-      if msg.cell_id and type(msg.cell_id) == "string" then
-        kernel.pending_cells[msg.cell_id] = nil
+      vim.schedule(function()
+        close_input_prompt(state)
+      end)
+    end
+
+  elseif msg_type == "execute_input" then
+    local _, cell = resolve_message_cell(state, msg)
+    if cell then
+      cell.execution_state = "busy"
+      cell._exec_started = msg.date
+      if msg.execution_count and msg.execution_count ~= vim.NIL then
+        cell.execution_count = msg.execution_count
       end
+      request_render(state)
+    end
+
+  elseif msg_type == "execute_reply" then
+    local _, cell = resolve_message_cell(state, msg)
+    if msg.cell_id then
+      kernel.pending_cells[msg.cell_id] = nil
+    end
+    if cell then
+      cell.execution_state = "idle"
+      cell._clear_on_next_output = nil
+      local started, finished = iso_seconds(cell._exec_started), iso_seconds(msg.date)
+      cell.execution_time = (started and finished and finished >= started) and (finished - started) or nil
+      if msg.status == "aborted" then
+        cell.execution_time = nil
+      end
+      if require("ipynb.config").get().kernel.record_timing and cell._exec_started and msg.date then
+        -- Same keys JupyterLab writes with "Record cell timing" enabled
+        cell.metadata = cell.metadata or {}
+        cell.metadata.execution = {
+          ["iopub.execute_input"] = cell._exec_started,
+          ["shell.execute_reply"] = msg.date,
+        }
+      end
+      request_render(state)
     end
 
   elseif msg_type == "input_request" then
@@ -267,46 +359,64 @@ local function handle_message(state, msg)
       )
     end)
 
-  elseif msg_type == "execute_input" then
-    local target_idx = resolve_message_cell(state, msg)
-    if target_idx and msg.execution_count then
-      update_cell_field(state, target_idx, "execution_count", msg.execution_count)
+  elseif msg_type == "output" then
+    local _, cell = resolve_message_cell(state, msg)
+    if cell and type(msg.output) == "table" then
+      local output_mod = require("ipynb.output")
+      if cell._clear_on_next_output then
+        -- clear_output(wait=True): replace instead of append, avoiding flicker
+        cell._clear_on_next_output = nil
+        cell.outputs = {}
+        cell._stream_state = nil
+      end
+      output_mod.append_output(cell, msg.output)
+      request_output_render(state, cell)
     end
 
-  elseif msg_type == "output" then
-    local target_idx, target_cell = resolve_message_cell(state, msg)
-    if target_idx and target_cell and msg.output then
-      vim.schedule(function()
-        local current_cell = state.cells and state.cells[target_idx] or nil
-        if current_cell and target_cell.id == current_cell.id then
-          local output_mod = require("ipynb.output")
-          output_mod.append_output(current_cell, msg.output)
-          output_mod.render_outputs(state, target_idx)
-        end
-      end)
+  elseif msg_type == "clear_output" then
+    local idx, cell = resolve_message_cell(state, msg)
+    if cell then
+      if msg.wait then
+        cell._clear_on_next_output = true
+      else
+        vim.schedule(function()
+          if state.cells[idx] == cell then
+            require("ipynb.output").clear_outputs(state, idx)
+          end
+        end)
+      end
+    end
+
+  elseif msg_type == "update_display" then
+    if type(msg.display_id) == "string" and type(msg.output) == "table" then
+      update_display(state, msg.display_id, msg.output)
     end
 
   elseif msg_type == "interrupted" then
     kernel.execution_state = "idle"
-    kernel.pending_cells = {}
-    close_input_prompt(state)
     vim.schedule(function()
+      close_input_prompt(state)
       vim.notify("Kernel interrupted", vim.log.levels.INFO)
     end)
 
-  elseif msg_type == "restarted" then
+  elseif msg_type == "restarted" or msg_type == "shutdown" then
     kernel.execution_state = "idle"
     kernel.pending_cells = {}
-    close_input_prompt(state)
+    if msg_type == "shutdown" then
+      kernel.connected = false
+    end
+    for _, cell in ipairs(state.cells or {}) do
+      if cell.execution_state and cell.execution_state ~= "idle" then
+        cell.execution_state = "idle"
+      end
+    end
+    request_render(state)
     vim.schedule(function()
-      vim.notify("Kernel restarted", vim.log.levels.INFO)
+      close_input_prompt(state)
+      if msg_type == "restarted" then
+        vim.notify("Kernel restarted", vim.log.levels.INFO)
+      end
     end)
-
-  elseif msg_type == "shutdown" then
-    kernel.connected = false
-    kernel.execution_state = "idle"
-    kernel.pending_cells = {}
-    close_input_prompt(state)
 
   elseif msg_type == "error" then
     vim.schedule(function()
@@ -339,28 +449,22 @@ local function handle_message(state, msg)
     end
   end
 end
+M._handle_message = handle_message
 
 ---Find a virtual environment python by walking up the directory tree
 ---@param start_path string Path to start searching from
 ---@return string|nil python_path
 local function find_venv_python(start_path)
   local venv_names = { ".venv", "venv", ".virtualenv", "env" }
-  local dir = vim.fn.fnamemodify(start_path, ":p:h")
-
-  while dir ~= "/" and dir ~= "" and dir ~= "." do
+  local rel = vim.fn.has("win32") == 1 and "/Scripts/python.exe" or "/bin/python"
+  for dir in vim.fs.parents(vim.fn.fnamemodify(start_path, ":p")) do
     for _, name in ipairs(venv_names) do
-      local python = dir .. "/" .. name .. "/bin/python"
+      local python = dir .. "/" .. name .. rel
       if vim.fn.executable(python) == 1 then
-        return python
+        return vim.fs.normalize(python)
       end
     end
-    local parent = vim.fn.fnamemodify(dir, ":h")
-    if parent == dir then
-      break
-    end
-    dir = parent
   end
-
   return nil
 end
 
@@ -386,14 +490,14 @@ local function discover_python(notebook_path, explicit_path)
     end
   end
 
-  local py3 = vim.fn.exepath("python3")
-  if py3 ~= "" then
-    return py3, "system"
-  end
-
-  local py = vim.fn.exepath("python")
-  if py ~= "" then
-    return py, "system"
+  -- On Windows "python" is the real interpreter; "python3" is usually only the
+  -- Microsoft Store stub in WindowsApps, which opens the Store instead of running.
+  local names = vim.fn.has("win32") == 1 and { "python", "python3", "py" } or { "python3", "python" }
+  for _, name in ipairs(names) do
+    local path = vim.fn.exepath(name)
+    if path ~= "" and not path:lower():find("\\windowsapps\\", 1, true) then
+      return path, "system"
+    end
   end
 
   return nil, "not found"
@@ -435,17 +539,25 @@ function M.start_bridge(state, python_path)
   local cmd = { python, bridge_path }
 
   -- Unbuffered stdout arrives in chunks: data[1] continues the previous
-  -- partial line, the last element starts the next one.
-  local stdout_pending = ""
+  -- partial line, the last element starts the next one. Partial pieces are
+  -- collected in a list so a large message costs O(n), not O(n^2), to rebuild.
+  local partial = {}
   local job_id = vim.fn.jobstart(cmd, {
     on_stdout = function(_, data, _)
-      data[1] = stdout_pending .. (data[1] or "")
-      stdout_pending = table.remove(data) or ""
-      for _, line in ipairs(data) do
-        if line ~= "" then
-          local ok, msg = pcall(vim.json.decode, line)
-          if ok and msg then
-            handle_message(state, msg)
+      for i, piece in ipairs(data) do
+        if i == #data then
+          if piece ~= "" then
+            partial[#partial + 1] = piece
+          end
+        else
+          partial[#partial + 1] = piece
+          local line = table.concat(partial)
+          partial = {}
+          if line ~= "" then
+            local ok, msg = pcall(vim.json.decode, line)
+            if ok and type(msg) == "table" then
+              handle_message(state, msg)
+            end
           end
         end
       end
@@ -498,16 +610,17 @@ end
 ---@param kernel_name string Kernel name (e.g., "python3", "julia-1.9")
 ---@return string language name for treesitter (e.g., "python", "julia")
 local function kernel_to_language(kernel_name)
-  if kernel_name:match('^python') then
+  local name = kernel_name:lower()
+  if name:match('^python') then
     return 'python'
-  elseif kernel_name:match('^julia') then
+  elseif name:match('^julia') then
     return 'julia'
-  elseif kernel_name:match('^ir') or kernel_name:match('^r') then
+  elseif name == 'ir' or name == 'r' or name:match('^ir[%-_]') or name:match('^r[%-_]') then
     return 'r'
-  else
-    return kernel_name:lower()
   end
+  return name
 end
+M._kernel_to_language = kernel_to_language
 
 ---Set the kernel name in notebook metadata
 ---@param state NotebookState
@@ -612,12 +725,15 @@ function M.execute(state, cell_idx)
 
   require("ipynb.output").clear_outputs(state, cell_idx)
 
-  cell.execution_state = "busy"
+  -- Queued until the kernel actually starts it (execute_input)
+  cell.execution_state = "queued"
+  cell.execution_time = nil
+  cell._exec_started = nil
   state.kernel.pending_cells[cell.id] = {
     cell_id = cell.id,
   }
 
-  require("ipynb.visuals").render_all(state)
+  request_render(state)
 
   return send_command(state, {
     action = "execute",

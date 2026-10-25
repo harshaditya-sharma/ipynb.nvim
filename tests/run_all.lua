@@ -39,7 +39,9 @@ local function ensure_env()
 end
 
 local function app_data_dir()
-  return join(vim.env.XDG_DATA_HOME, vim.env.NVIM_APPNAME)
+  -- stdpath('data') is <XDG_DATA_HOME>/<NVIM_APPNAME>-data on Windows
+  local suffix = is_windows() and '-data' or ''
+  return join(vim.env.XDG_DATA_HOME, vim.env.NVIM_APPNAME .. suffix)
 end
 
 local function lazy_path()
@@ -158,7 +160,8 @@ local function ensure_venv_lsp()
   end
 
   local venv_dir = join(tests_dir, '.nvim-test/venv')
-  local py = exe('python3') and 'python3' or 'python'
+  -- On Windows python3 is usually the Microsoft Store stub; python is the real one
+  local py = (not is_windows() and exe('python3')) and 'python3' or 'python'
   if not exe(py) then
     print('WARN: python not found; skipping LSP bootstrap')
     return
@@ -240,6 +243,14 @@ local function run_test_file(test_file)
     XDG_CONFIG_HOME = vim.env.XDG_CONFIG_HOME,
     NVIM_APPNAME = vim.env.NVIM_APPNAME,
     IPYNB_TEST_SKIP_PARSER_SO = vim.env.IPYNB_TEST_SKIP_PARSER_SO,
+    IPYNB_TEST_PYTHON = vim.env.IPYNB_TEST_PYTHON,
+    -- Windows needs these for Python/Jupyter and temp paths
+    SYSTEMROOT = vim.env.SYSTEMROOT,
+    TEMP = vim.env.TEMP,
+    TMP = vim.env.TMP,
+    USERPROFILE = vim.env.USERPROFILE,
+    APPDATA = vim.env.APPDATA,
+    LOCALAPPDATA = vim.env.LOCALAPPDATA,
   }
 
   -- Default LSP env (pyright/basedpyright)
@@ -381,6 +392,9 @@ local tests = {
   join(root, 'tests/test_output.lua'),
   join(root, 'tests/test_kernel_stdout.lua'),
   join(root, 'tests/test_io.lua'),
+  join(root, 'tests/test_compat.lua'),
+  join(root, 'tests/test_kernel_messages.lua'),
+  join(root, 'tests/test_kernel_e2e.lua'),
   join(root, 'tests/test_shadow.lua'),
   join(root, 'tests/test_lsp.lua'),
   join(root, 'tests/test_lsp_go.lua'),

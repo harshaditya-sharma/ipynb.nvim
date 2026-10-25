@@ -81,6 +81,26 @@ local function get_language_info(state)
   return lang, ext
 end
 
+---Shadow lines for one cell's content (always the same line count)
+---@param state NotebookState
+---@param lines string[] Cell source lines
+---@param cell_type string
+---@return string[]
+function M.shadow_content(state, lines, cell_type)
+  if cell_type ~= 'code' then
+    local blank = {}
+    for i = 1, #lines do
+      blank[i] = ''
+    end
+    return blank
+  end
+  local magics = require('ipynb.magics')
+  if magics.applies_to(state.shadow_lang or get_language_info(state)) then
+    return magics.mask(lines)
+  end
+  return lines
+end
+
 ---Generate shadow buffer content from cells
 ---Code cells: actual content, Markdown/raw cells: blank lines
 ---Maintains exact 1:1 line mapping with facade buffer
@@ -100,17 +120,8 @@ function M.generate_shadow_lines(state)
     -- Start marker line: always blank in shadow
     table.insert(shadow_lines, '')
 
-    -- Content lines
-    local source_lines = vim.split(cell.source, '\n', { plain = true })
-    for _, src_line in ipairs(source_lines) do
-      if cell.type == 'code' then
-        -- Code cell: keep the actual code
-        table.insert(shadow_lines, src_line)
-      else
-        -- Markdown/raw cell: blank line
-        table.insert(shadow_lines, '')
-      end
-    end
+    -- Content lines: code as-is (IPython syntax masked), other cells blank
+    vim.list_extend(shadow_lines, M.shadow_content(state, vim.split(cell.source, '\n', { plain = true }), cell.type))
 
     -- End marker line: always blank in shadow
     table.insert(shadow_lines, '')
@@ -341,17 +352,7 @@ function M.sync_shadow_region(state, start_line, old_end_line, new_lines, cell_t
     return
   end
 
-  local shadow_lines
-  if cell_type == 'code' then
-    -- Code cell: copy actual content
-    shadow_lines = new_lines
-  else
-    -- Markdown/raw cell: use blank lines to preserve line count
-    shadow_lines = {}
-    for _ = 1, #new_lines do
-      table.insert(shadow_lines, '')
-    end
-  end
+  local shadow_lines = M.shadow_content(state, new_lines, cell_type)
 
   vim.api.nvim_buf_set_lines(state.shadow_buf, start_line, old_end_line, false, shadow_lines)
 

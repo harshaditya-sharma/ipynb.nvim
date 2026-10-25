@@ -13,6 +13,8 @@ wheels/
 # Tree-sitter compiled parsers (platform-specific)
 *.dylib
 *.so
+*.dll
+tree-sitter-ipynb/parser/
 
 # Test sandbox
 tests/.nvim-test/

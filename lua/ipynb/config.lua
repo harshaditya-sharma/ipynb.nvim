@@ -90,6 +90,7 @@ local M = {}
 ---@field auto_connect boolean Auto-connect to kernel on notebook open
 ---@field show_status boolean Show kernel status in statusline
 ---@field python_path string|nil Custom Python path for kernel bridge
+---@field record_timing boolean Save start/end times in cell metadata like JupyterLab's "Record cell timing"
 
 ---@class ImageConfig
 ---@field enabled boolean Enable image rendering (requires snacks.nvim)
@@ -174,6 +175,7 @@ M.defaults = {
 		auto_connect = false,
 		show_status = true,
 		python_path = nil, -- Custom Python path (otherwise auto-discovered)
+		record_timing = false, -- Save cell start/end times in metadata (JupyterLab format)
 	},
 	images = {
 		enabled = true,

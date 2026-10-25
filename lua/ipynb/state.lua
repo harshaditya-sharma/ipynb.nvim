@@ -63,39 +63,32 @@ local M = {}
 ---@type table<number, NotebookState>
 M.notebooks = {}
 
--- Word lists for human-readable cell IDs (JEP 62 Option D)
-local words = require('ipynb.words')
+-- Seed the fallback generator once at module load
+math.randomseed(vim.uv.hrtime())
 
--- Seed random once at module load
-math.randomseed(vim.loop.hrtime())
+---Check a cell ID against nbformat 4.5 (JEP 62): ^[a-zA-Z0-9-_]+$, length 1-64
+---@param id any
+---@return boolean
+function M.is_valid_cell_id(id)
+  return type(id) == 'string' and #id >= 1 and #id <= 64 and id:find('^[%w_-]+$') ~= nil
+end
 
----Generate a unique cell ID (nbformat 4.5+ compliant, JEP 62)
----Format: {adjective}-{animal} e.g., "bold-fox", "azure-orca"
----Per JEP 62: must match ^[a-zA-Z0-9-_]+$, length 1-64
----755 adjectives × 320 animals = 241,600 combinations
+---Generate a unique cell ID the way Jupyter does (8 hex characters)
 ---@param existing_ids table<string, boolean>|nil Set of existing IDs to avoid collisions
 ---@return string
 function M.generate_cell_id(existing_ids)
-  local max_attempts = 100
-  for _ = 1, max_attempts do
-    local id = words.adjectives[math.random(#words.adjectives)]
-      .. '-' .. words.animals[math.random(#words.animals)]
+  while true do
+    local ok, bytes = pcall(vim.uv.random, 4)
+    local id
+    if ok and bytes then
+      id = bytes:gsub('.', function(c) return string.format('%02x', c:byte()) end)
+    else
+      id = string.format('%08x', math.random(0, 0x7fffffff))
+    end
     if not existing_ids or not existing_ids[id] then
       return id
     end
   end
-
-  -- Fallback: append integer suffix
-  local base = words.adjectives[math.random(#words.adjectives)]
-    .. '-' .. words.animals[math.random(#words.animals)]
-  if not existing_ids or not existing_ids[base] then
-    return base
-  end
-  local suffix = 1
-  while existing_ids[base .. '-' .. suffix] do
-    suffix = suffix + 1
-  end
-  return base .. '-' .. suffix
 end
 
 ---Create a new notebook state
@@ -174,17 +167,11 @@ end
 ---@param path string File path to check
 ---@return NotebookState|nil
 function M.get_by_path(path)
-  local normalized = vim.fn.fnamemodify(path, ':p')
+  local key = require('ipynb.lsp.uri').path_key
+  local wanted = key(path)
   for _, state in pairs(M.notebooks) do
-    -- Check facade/source path
-    if state.facade_path then
-      local facade_norm = vim.fn.fnamemodify(state.facade_path, ':p')
-      if facade_norm == normalized then
-        return state
-      end
-    end
-    -- Check shadow path
-    if state.shadow_path and state.shadow_path == path then
+    if (state.facade_path and key(state.facade_path) == wanted)
+      or (state.shadow_path and key(state.shadow_path) == wanted) then
       return state
     end
   end

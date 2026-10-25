@@ -2,629 +2,464 @@
 """
 Jupyter kernel bridge for ipynb.nvim
 
-Communicates with Neovim via JSON over stdin/stdout.
-Uses jupyter_client to manage kernel connections.
+Talks to Neovim with one JSON object per line on stdin/stdout and to a Jupyter
+kernel through jupyter_client.
+
+Everything that touches the kernel's ZeroMQ sockets runs on a single asyncio
+event loop (sockets are not thread-safe). A plain thread only reads stdin and
+hands lines to the loop, so a long-running cell, a slow completion or a pending
+inspect never blocks an interrupt.
 """
 
+import asyncio
+import inspect
 import json
 import sys
 import threading
-import queue
 import uuid
-from typing import Optional, Dict, Any
+from datetime import datetime
+from typing import Any, Dict, Optional
 
 from inspect_parsers import get_parser
 
-
 try:
-    import jupyter_client
+    from jupyter_client import AsyncKernelManager
 except ImportError:
     print(json.dumps({
         "type": "error",
-        "error": "jupyter_client not installed. Install with: pip install jupyter_client"
+        "error": "jupyter_client not installed. Install with: pip install jupyter_client ipykernel",
     }), flush=True)
     sys.exit(1)
 
+REQUEST_TIMEOUT = 10.0
+READY_TIMEOUT = 60.0
+
+
+def _iso(value: Any) -> Optional[str]:
+    """Header dates arrive as datetime objects; send ISO strings."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value if isinstance(value, str) else None
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
 
 class KernelBridge:
-    """Manages a Jupyter kernel connection and handles message passing."""
+    """One kernel connection plus routing of its messages to notebook cells."""
 
-    def __init__(self):
-        self.kernel_manager: Optional[jupyter_client.KernelManager] = None
-        self.kernel_client: Optional[jupyter_client.KernelClient] = None
-        self.kernel_name: str = "python3"
-        self.kernel_language: Optional[str] = None
-        self.execution_count: int = 0
-        self.pending_executions: Dict[str, Dict[str, Any]] = {}
-        self.iopub_thread: Optional[threading.Thread] = None
-        self.stdin_thread: Optional[threading.Thread] = None
-        self.pending_input_requests: Dict[str, Dict[str, Any]] = {}
-        self.running = True
-        self.output_queue = queue.Queue()
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self.loop = loop
+        self.km: Optional[AsyncKernelManager] = None
+        self.kc = None
+        self.owns_kernel = False
+        self.kernel_name = "python3"
+        self.language: Optional[str] = None
+        self.executions: Dict[str, Dict[str, Any]] = {}  # execute msg_id -> {cell_id}
+        self.replies: Dict[str, asyncio.Future] = {}  # shell msg_id -> reply future
+        self.inputs: Dict[str, str] = {}  # input request_id -> execute msg_id
+        self.tasks: list = []
 
-    def send_message(self, msg: Dict[str, Any]):
-        """Send a JSON message to stdout."""
-        print(json.dumps(msg), flush=True)
+    # -- output -----------------------------------------------------------------
 
-    def start_kernel(self, kernel_name: str = "python3") -> bool:
-        """Start a new Jupyter kernel."""
+    def send(self, msg: Dict[str, Any]) -> None:
+        line = json.dumps(msg, default=_json_default)
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+    def error(self, text: str, **extra: Any) -> None:
+        self.send({"type": "error", "error": text, **extra})
+
+    # -- lifecycle --------------------------------------------------------------
+
+    async def _attach(self) -> None:
+        self.kc = self.km.client()
+        self.kc.start_channels()
+        await self.kc.wait_for_ready(timeout=READY_TIMEOUT)
+        try:
+            self.language = self.km.kernel_spec.language
+        except Exception:
+            self.language = None
+        self.tasks = [
+            asyncio.ensure_future(self._pump(self.kc.get_iopub_msg, self._on_iopub)),
+            asyncio.ensure_future(self._pump(self.kc.get_shell_msg, self._on_shell)),
+            asyncio.ensure_future(self._pump(self.kc.get_stdin_msg, self._on_stdin)),
+        ]
+
+    async def start(self, kernel_name: str) -> None:
+        if self.kc:
+            self.error("Kernel already running")
+            return
         try:
             self.kernel_name = kernel_name
-            self.kernel_manager = jupyter_client.KernelManager(kernel_name=kernel_name)
-            self.kernel_manager.start_kernel()
-            self.kernel_client = self.kernel_manager.client()
-            self.kernel_client.start_channels()
-
-            # Wait for kernel to be ready
-            self.kernel_client.wait_for_ready(timeout=30)
-
-            # Start iopub listener thread
-            self._start_iopub_listener()
-            self._start_stdin_listener()
-
-            # Get language from kernelspec
-            language = None
-            try:
-                language = self.kernel_manager.kernel_spec.language
-            except Exception:
-                pass
-            self.kernel_language = language
-
-            self.send_message({
+            self.km = AsyncKernelManager(kernel_name=kernel_name)
+            await self.km.start_kernel()
+            self.owns_kernel = True
+            await self._attach()
+            self.send({
                 "type": "kernel_started",
                 "kernel_name": kernel_name,
-                "kernel_id": self.kernel_manager.kernel_id or "unknown",
-                "language": language
+                "kernel_id": getattr(self.km, "kernel_id", None) or "unknown",
+                "language": self.language,
             })
-            return True
         except Exception as e:
-            self.send_message({
-                "type": "error",
-                "error": f"Failed to start kernel: {str(e)}"
-            })
-            return False
+            self.error(f"Failed to start kernel: {e}")
 
-    def connect_to_kernel(self, connection_file: str) -> bool:
-        """Connect to an existing kernel via connection file."""
+    async def connect(self, connection_file: str) -> None:
+        if self.kc:
+            self.error("Kernel already running")
+            return
         try:
-            self.kernel_manager = jupyter_client.KernelManager(connection_file=connection_file)
-            self.kernel_manager.load_connection_file()
-            self.kernel_client = self.kernel_manager.client()
-            self.kernel_client.start_channels()
-            self.kernel_client.wait_for_ready(timeout=30)
+            self.km = AsyncKernelManager(connection_file=connection_file)
+            self.km.load_connection_file()
+            self.owns_kernel = False
+            await self._attach()
+            self.send({
+                "type": "kernel_connected",
+                "connection_file": connection_file,
+                "language": self.language,
+            })
+        except Exception as e:
+            self.error(f"Failed to connect to kernel: {e}")
 
-            self._start_iopub_listener()
-            self._start_stdin_listener()
+    async def interrupt(self) -> None:
+        if not self.km:
+            return
+        try:
+            if self.owns_kernel:
+                await self.km.interrupt_kernel()
+            else:
+                # Not our process: ask the kernel itself over the control channel
+                msg = self.kc.session.msg("interrupt_request", {})
+                self.kc.control_channel.send(msg)
+            self.inputs.clear()
+            self.send({"type": "interrupted"})
+        except Exception as e:
+            self.error(f"Failed to interrupt: {e}")
 
-            language = None
+    async def restart(self) -> None:
+        if not self.km or not self.owns_kernel:
+            self.error("Restart is only available for kernels started by ipynb.nvim")
+            return
+        try:
+            self._drop_pending()
+            await self.km.restart_kernel(now=False)
+            await self._wait_ready()
+            self.send({"type": "restarted"})
+        except Exception as e:
+            self.error(f"Failed to restart: {e}")
+
+    async def shutdown(self) -> None:
+        for task in self.tasks:
+            task.cancel()
+        self.tasks = []
+        self._drop_pending()
+        if self.kc:
+            self.kc.stop_channels()
+        if self.km and self.owns_kernel:
             try:
-                language = self.kernel_manager.kernel_spec.language
+                await self.km.shutdown_kernel(now=True)
             except Exception:
                 pass
-            self.kernel_language = language
+        self.kc = None
+        self.km = None
+        self.send({"type": "shutdown"})
 
-            self.send_message({
-                "type": "kernel_connected",
-                "connection_file": connection_file
-            })
-            return True
-        except Exception as e:
-            self.send_message({
-                "type": "error",
-                "error": f"Failed to connect to kernel: {str(e)}"
-            })
-            return False
+    async def _wait_ready(self) -> None:
+        # The shell pump owns the shell socket now, so poll with kernel_info
+        # requests instead of kc.wait_for_ready (which reads the socket itself).
+        deadline = self.loop.time() + READY_TIMEOUT
+        while self.loop.time() < deadline:
+            future = self.loop.create_future()
+            msg_id = self.kc.kernel_info()
+            self.replies[msg_id] = future
+            try:
+                await asyncio.wait_for(future, 2)
+                return
+            except asyncio.TimeoutError:
+                self.replies.pop(msg_id, None)
+        raise TimeoutError("kernel did not become ready after restart")
 
-    def _start_iopub_listener(self):
-        """Start a thread to listen for iopub messages."""
-        def listener():
-            while self.running and self.kernel_client:
-                try:
-                    msg = self.kernel_client.get_iopub_msg(timeout=0.5)
-                    self._handle_iopub_message(msg)
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    if self.running:
-                        self.send_message({
-                            "type": "error",
-                            "error": f"IOPub listener error: {str(e)}"
-                        })
+    def _drop_pending(self) -> None:
+        for future in self.replies.values():
+            if not future.done():
+                future.cancel()
+        self.replies.clear()
+        self.executions.clear()
+        self.inputs.clear()
 
-        self.iopub_thread = threading.Thread(target=listener, daemon=True)
-        self.iopub_thread.start()
+    # -- kernel channels --------------------------------------------------------
 
-    def _start_stdin_listener(self):
-        """Start a thread to listen for stdin messages."""
-        def listener():
-            while self.running and self.kernel_client:
-                try:
-                    msg = self.kernel_client.get_stdin_msg(timeout=0.5)
-                    self._handle_stdin_message(msg)
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    if self.running:
-                        self.send_message({
-                            "type": "error",
-                            "error": f"Stdin listener error: {str(e)}"
-                        })
+    async def _pump(self, getter, handler) -> None:
+        while True:
+            try:
+                msg = await getter(timeout=1)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # queue.Empty on timeout, or a socket closing during restart
+                await asyncio.sleep(0)
+                continue
+            try:
+                handler(msg)
+            except Exception as e:
+                self.error(f"Failed to handle {msg.get('msg_type', '?')}: {e}")
 
-        self.stdin_thread = threading.Thread(target=listener, daemon=True)
-        self.stdin_thread.start()
+    def _cell_for(self, msg: Dict[str, Any]) -> Optional[str]:
+        parent_id = msg.get("parent_header", {}).get("msg_id", "")
+        return self.executions.get(parent_id, {}).get("cell_id")
 
-    def _clear_input_requests_for_msg(self, msg_id: str):
-        """Remove pending stdin requests associated with an execution message."""
-        to_remove = [
-            request_id
-            for request_id, request in self.pending_input_requests.items()
-            if request.get("msg_id") == msg_id
-        ]
-        for request_id in to_remove:
-            self.pending_input_requests.pop(request_id, None)
-
-    def _handle_iopub_message(self, msg: Dict[str, Any]):
-        """Handle a message from the iopub channel."""
+    def _on_iopub(self, msg: Dict[str, Any]) -> None:
         msg_type = msg.get("msg_type", "")
         content = msg.get("content", {})
-        parent_header = msg.get("parent_header", {})
-        msg_id = parent_header.get("msg_id", "")
-
-        # Find the cell this message belongs to
-        exec_info = self.pending_executions.get(msg_id, {})
-        cell_id = exec_info.get("cell_id")
+        cell_id = self._cell_for(msg)
+        date = _iso(msg.get("header", {}).get("date"))
 
         if msg_type == "status":
-            execution_state = content.get("execution_state", "")
-            self.send_message({
-                "type": "status",
-                "state": execution_state,
-                "cell_id": cell_id
-            })
-            if execution_state == "idle":
-                # Execution is complete, drop tracking to prevent unbounded growth.
-                self.pending_executions.pop(msg_id, None)
-                self._clear_input_requests_for_msg(msg_id)
-
-        elif msg_type == "stream":
-            self.send_message({
-                "type": "output",
-                "cell_id": cell_id,
-                "output": {
-                    "output_type": "stream",
-                    "name": content.get("name", "stdout"),
-                    "text": content.get("text", "")
-                }
-            })
-
-        elif msg_type == "execute_result":
-            self.send_message({
-                "type": "output",
-                "cell_id": cell_id,
-                "output": {
-                    "output_type": "execute_result",
-                    "execution_count": content.get("execution_count"),
-                    "data": content.get("data", {}),
-                    "metadata": content.get("metadata", {})
-                }
-            })
-
-        elif msg_type == "display_data":
-            self.send_message({
-                "type": "output",
-                "cell_id": cell_id,
-                "output": {
-                    "output_type": "display_data",
-                    "data": content.get("data", {}),
-                    "metadata": content.get("metadata", {})
-                }
-            })
-
-        elif msg_type == "error":
-            self.send_message({
-                "type": "output",
-                "cell_id": cell_id,
-                "output": {
-                    "output_type": "error",
-                    "ename": content.get("ename", "Error"),
-                    "evalue": content.get("evalue", ""),
-                    "traceback": content.get("traceback", [])
-                }
-            })
-
+            self.send({"type": "status", "state": content.get("execution_state", ""),
+                       "cell_id": cell_id, "date": date})
         elif msg_type == "execute_input":
-            # Execution started
-            self.send_message({
-                "type": "execute_input",
-                "cell_id": cell_id,
-                "execution_count": content.get("execution_count")
-            })
+            self.send({"type": "execute_input", "cell_id": cell_id,
+                       "execution_count": content.get("execution_count"), "date": date})
+        elif msg_type == "stream":
+            self.send({"type": "output", "cell_id": cell_id, "output": {
+                "output_type": "stream",
+                "name": content.get("name", "stdout"),
+                "text": content.get("text", ""),
+            }})
+        elif msg_type in ("execute_result", "display_data", "update_display_data"):
+            output = {
+                "output_type": "display_data" if msg_type == "update_display_data" else msg_type,
+                "data": content.get("data", {}),
+                "metadata": content.get("metadata", {}),
+            }
+            if msg_type == "execute_result":
+                output["execution_count"] = content.get("execution_count")
+            display_id = (content.get("transient") or {}).get("display_id")
+            if msg_type == "update_display_data":
+                # Updates may target any cell that showed this display id
+                self.send({"type": "update_display", "display_id": display_id, "output": output})
+                return
+            if display_id:
+                output["transient"] = {"display_id": display_id}
+            self.send({"type": "output", "cell_id": cell_id, "output": output})
+        elif msg_type == "error":
+            self.send({"type": "output", "cell_id": cell_id, "output": {
+                "output_type": "error",
+                "ename": content.get("ename", "Error"),
+                "evalue": content.get("evalue", ""),
+                "traceback": content.get("traceback", []),
+            }})
+        elif msg_type == "clear_output":
+            self.send({"type": "clear_output", "cell_id": cell_id, "wait": bool(content.get("wait"))})
 
-    def _handle_stdin_message(self, msg: Dict[str, Any]):
-        """Handle a message from the stdin channel."""
+    def _on_shell(self, msg: Dict[str, Any]) -> None:
+        parent_id = msg.get("parent_header", {}).get("msg_id", "")
+        future = self.replies.pop(parent_id, None)
+        if future and not future.done():
+            future.set_result(msg)
+        if msg.get("msg_type") == "execute_reply":
+            info = self.executions.pop(parent_id, None)
+            for request_id in [r for r, m in self.inputs.items() if m == parent_id]:
+                self.inputs.pop(request_id, None)
+            if info:
+                content = msg.get("content", {})
+                self.send({
+                    "type": "execute_reply",
+                    "cell_id": info["cell_id"],
+                    "status": content.get("status", "ok"),
+                    "execution_count": content.get("execution_count"),
+                    "date": _iso(msg.get("header", {}).get("date")),
+                })
+
+    def _on_stdin(self, msg: Dict[str, Any]) -> None:
         if msg.get("msg_type") != "input_request":
             return
-
         content = msg.get("content", {})
-        parent_header = msg.get("parent_header", {})
-        parent_msg_id = parent_header.get("msg_id", "")
-
-        exec_info = self.pending_executions.get(parent_msg_id, {})
-        cell_id = exec_info.get("cell_id")
-
+        parent_id = msg.get("parent_header", {}).get("msg_id", "")
         request_id = uuid.uuid4().hex
-        self.pending_input_requests[request_id] = {
-            "msg_id": parent_msg_id,
-            "cell_id": cell_id,
-        }
-
-        self.send_message({
+        self.inputs[request_id] = parent_id
+        self.send({
             "type": "input_request",
             "request_id": request_id,
-            "cell_id": cell_id,
+            "cell_id": self._cell_for(msg),
             "prompt": content.get("prompt", ""),
             "password": bool(content.get("password", False)),
         })
 
-    def execute(
-        self,
-        code: str,
-        cell_id: str,
-        user_expressions: Optional[Dict[str, str]] = None,
-    ) -> Optional[str]:
-        """Execute code in the kernel with optional user_expressions for namespace capture."""
-        if not self.kernel_client:
-            self.send_message({
-                "type": "error",
-                "error": "No kernel connected",
-                "cell_id": cell_id
-            })
+    async def _request(self, msg_id: str) -> Optional[Dict[str, Any]]:
+        future = self.loop.create_future()
+        self.replies[msg_id] = future
+        try:
+            return await asyncio.wait_for(future, REQUEST_TIMEOUT)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            self.replies.pop(msg_id, None)
             return None
 
-        try:
-            msg_id = self.kernel_client.execute(code, user_expressions=user_expressions or {})
-            self.pending_executions[msg_id] = {
-                "cell_id": cell_id,
-                "code": code,
-                "has_user_expressions": bool(user_expressions)
-            }
-            self.send_message({
-                "type": "execute_request",
-                "cell_id": cell_id,
-                "msg_id": msg_id
-            })
+    # -- requests from Neovim ---------------------------------------------------
 
-            # If user_expressions provided, wait for execute_reply on shell channel
-            if user_expressions:
-                self._wait_for_execute_reply(msg_id, cell_id)
-
-            return msg_id
-        except Exception as e:
-            self.send_message({
-                "type": "error",
-                "error": f"Execution failed: {str(e)}",
-                "cell_id": cell_id
-            })
-            return None
-
-    def _wait_for_execute_reply(self, msg_id: str, cell_id: str):
-        """Wait for execute_reply on shell channel and extract user_expressions results."""
-        try:
-            # Poll shell channel for the execute_reply (with timeout)
-            while True:
-                reply = self.kernel_client.get_shell_msg(timeout=10)
-                if not reply:
-                    break
-                # Check if this is the reply for our execution
-                if reply.get("parent_header", {}).get("msg_id") == msg_id:
-                    if reply.get("msg_type") == "execute_reply":
-                        content = reply.get("content", {})
-                        user_expr_results = content.get("user_expressions", {})
-
-                        # Extract __ns__ result if present
-                        ns_result = user_expr_results.get("__ns__", {})
-                        if ns_result.get("status") == "ok":
-                            ns_data = ns_result.get("data", {}).get("text/plain", "{}")
-                            self.send_message({
-                                "type": "namespace",
-                                "cell_id": cell_id,
-                                "namespace_repr": ns_data
-                            })
-                        elif ns_result.get("status") == "error":
-                            # user_expressions evaluation failed, don't crash
-                            pass
-                        break
-        except Exception as e:
-            # Don't fail execution if namespace capture fails
-            self.send_message({
-                "type": "error",
-                "error": f"Warning: Failed to capture namespace: {str(e)}"
-            })
-
-    def interrupt(self):
-        """Interrupt the kernel."""
-        if self.kernel_manager:
-            try:
-                self.kernel_manager.interrupt_kernel()
-                self.pending_input_requests.clear()
-                self.send_message({"type": "interrupted"})
-            except Exception as e:
-                self.send_message({
-                    "type": "error",
-                    "error": f"Failed to interrupt: {str(e)}"
-                })
-
-    def restart(self):
-        """Restart the kernel."""
-        if self.kernel_manager:
-            try:
-                self.kernel_manager.restart_kernel()
-                self.kernel_client.wait_for_ready(timeout=30)
-                self.execution_count = 0
-                self.pending_executions.clear()
-                self.pending_input_requests.clear()
-                self.send_message({"type": "restarted"})
-            except Exception as e:
-                self.send_message({
-                    "type": "error",
-                    "error": f"Failed to restart: {str(e)}"
-                })
-
-    def shutdown(self):
-        """Shutdown the kernel."""
-        self.running = False
-        self.pending_input_requests.clear()
-        if self.kernel_client:
-            self.kernel_client.stop_channels()
-        if self.kernel_manager:
-            try:
-                self.kernel_manager.shutdown_kernel(now=True)
-            except Exception:
-                pass
-        self.send_message({"type": "shutdown"})
-
-    def input_reply(self, request_id: str, value: str):
-        """Send stdin reply for a pending input request."""
-        if not self.kernel_client:
-            self.send_message({
-                "type": "error",
-                "error": "No kernel connected"
-            })
+    def execute(self, code: str, cell_id: str, stop_on_error: bool = True) -> None:
+        if not self.kc:
+            self.error("No kernel connected", cell_id=cell_id)
             return
+        msg_id = self.kc.execute(code, stop_on_error=stop_on_error)
+        self.executions[msg_id] = {"cell_id": cell_id}
+        self.send({"type": "execute_request", "cell_id": cell_id, "msg_id": msg_id})
 
-        if request_id not in self.pending_input_requests:
-            self.send_message({
-                "type": "error",
-                "error": f"Unknown input request_id: {request_id}"
-            })
-            return
-
-        try:
-            self.kernel_client.input(value)
-            self.pending_input_requests.pop(request_id, None)
-        except Exception as e:
-            self.send_message({
-                "type": "error",
-                "error": f"Failed to send input reply: {str(e)}"
-            })
-
-    def get_kernel_info(self):
-        """Get kernel information."""
-        if self.kernel_client:
-            try:
-                info = self.kernel_client.kernel_info()
-                self.send_message({
-                    "type": "kernel_info",
-                    "info": info
-                })
-            except Exception as e:
-                self.send_message({
-                    "type": "error",
-                    "error": f"Failed to get kernel info: {str(e)}"
-                })
+    def input_reply(self, request_id: str, value: str) -> None:
+        if not self.kc:
+            self.error("No kernel connected")
+        elif request_id not in self.inputs:
+            self.error(f"Unknown input request_id: {request_id}")
         else:
-            self.send_message({
-                "type": "kernel_info",
-                "info": None,
-                "connected": False
-            })
+            self.inputs.pop(request_id, None)
+            self.kc.input(value)
 
-    def is_alive(self) -> bool:
-        """Check if the kernel is alive."""
-        if self.kernel_manager:
-            return self.kernel_manager.is_alive()
-        return False
+    async def complete(self, code: str, cursor_pos: int, request_id: Optional[str]) -> None:
+        reply = await self._request(self.kc.complete(code, cursor_pos)) if self.kc else None
+        content = (reply or {}).get("content", {})
+        self.send({
+            "type": "complete_reply",
+            "request_id": request_id,
+            "matches": content.get("matches", []),
+            "cursor_start": content.get("cursor_start", cursor_pos),
+            "cursor_end": content.get("cursor_end", cursor_pos),
+            "metadata": content.get("metadata", {}),
+        })
 
-    def complete(self, code: str, cursor_pos: int):
-        """Request code completion."""
-        if not self.kernel_client:
-            self.send_message({
-                "type": "error",
-                "error": "No kernel connected"
-            })
-            return
+    async def inspect(self, code: str, cursor_pos: int, detail_level: int, request_id: Optional[str]) -> None:
+        reply = await self._request(self.kc.inspect(code, cursor_pos, detail_level)) if self.kc else None
+        content = (reply or {}).get("content", {})
+        data = content.get("data", {})
+        self.send({
+            "type": "inspect_reply",
+            "request_id": request_id,
+            "found": bool(content.get("found", False)),
+            "sections": get_parser(self.language, self.kernel_name)(data) if data else {},
+            "data": data,
+            "metadata": content.get("metadata", {}),
+        })
 
-        try:
-            msg_id = self.kernel_client.complete(code, cursor_pos)
-            # Completions come back on shell channel
-            reply = self.kernel_client.get_shell_msg(timeout=5)
-            if reply and reply.get("msg_type") == "complete_reply":
-                content = reply.get("content", {})
-                self.send_message({
-                    "type": "complete_reply",
-                    "matches": content.get("matches", []),
-                    "cursor_start": content.get("cursor_start", 0),
-                    "cursor_end": content.get("cursor_end", cursor_pos),
-                    "metadata": content.get("metadata", {})
-                })
-        except Exception as e:
-            self.send_message({
-                "type": "error",
-                "error": f"Completion failed: {str(e)}"
-            })
+    async def kernel_info(self) -> None:
+        reply = await self._request(self.kc.kernel_info()) if self.kc else None
+        self.send({"type": "kernel_info", "info": (reply or {}).get("content"), "connected": self.kc is not None})
 
-    def inspect(self, code: str, cursor_pos: int, detail_level: int = 0, request_id: Optional[str] = None):
-        """Request variable/object inspection using Jupyter's inspect_request protocol."""
-        if not self.kernel_client:
-            self.send_message({
-                "type": "error",
-                "error": "No kernel connected"
-            })
-            return
+    async def is_alive(self) -> None:
+        alive = False
+        if self.km and self.owns_kernel:
+            alive = self.km.is_alive()
+        elif self.kc:
+            alive = self.kc.is_alive()
+        if inspect.isawaitable(alive):
+            alive = await alive
+        self.send({"type": "is_alive", "alive": bool(alive)})
 
-        try:
-            msg_id = self.kernel_client.inspect(code, cursor_pos, detail_level)
-            # Inspection reply comes back on shell channel - wait for OUR reply
-            while True:
-                reply = self.kernel_client.get_shell_msg(timeout=5)
-                if not reply:
-                    break
-                # Check if this reply is for our request
-                parent_msg_id = reply.get("parent_header", {}).get("msg_id")
-                if parent_msg_id != msg_id:
-                    # Not our reply, keep waiting
-                    continue
-                if reply.get("msg_type") == "inspect_reply":
-                    content = reply.get("content", {})
-                    data = content.get("data", {})
-                    sections = {}
-                    # Return raw text/plain for now; no custom parsing
-                    parser = get_parser(self.kernel_language, self.kernel_name)
-                    sections = parser(data)
-                    self.send_message({
-                        "type": "inspect_reply",
-                        "request_id": request_id,
-                        "found": content.get("found", False),
-                        "sections": sections,
-                        "data": data,
-                        "metadata": content.get("metadata", {})
-                    })
-                    return
-                break
-            # No valid reply found
-            self.send_message({
-                "type": "inspect_reply",
-                "request_id": request_id,
-                "found": False,
-                "sections": {},
-                "data": {},
-                "metadata": {}
-            })
-        except Exception as e:
-            self.send_message({
-                "type": "error",
-                "error": f"Inspection failed: {str(e)}"
-            })
-
-
-def main():
-    """Main entry point - read commands from stdin, send responses to stdout."""
-    bridge = KernelBridge()
-
-    # Signal ready
-    bridge.send_message({"type": "ready"})
-
-    try:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-
-            try:
-                cmd = json.loads(line)
-            except json.JSONDecodeError as e:
-                bridge.send_message({
-                    "type": "error",
-                    "error": f"Invalid JSON: {str(e)}"
-                })
-                continue
-
-            action = cmd.get("action", "")
-
-            if action == "start":
-                kernel_name = cmd.get("kernel_name", "python3")
-                bridge.start_kernel(kernel_name)
-
-            elif action == "connect":
-                connection_file = cmd.get("connection_file")
-                if connection_file:
-                    bridge.connect_to_kernel(connection_file)
-                else:
-                    bridge.send_message({
-                        "type": "error",
-                        "error": "Missing connection_file parameter"
-                    })
-
-            elif action == "execute":
-                code = cmd.get("code", "")
-                cell_id = cmd.get("cell_id")
-                if not isinstance(cell_id, str) or not cell_id:
-                    bridge.send_message({
-                        "type": "error",
-                        "error": "Missing required cell_id for execute action"
-                    })
-                    continue
-                user_expressions = cmd.get("user_expressions")
-                bridge.execute(code, cell_id, user_expressions)
-
-            elif action == "interrupt":
-                bridge.interrupt()
-
-            elif action == "restart":
-                bridge.restart()
-
-            elif action == "shutdown":
-                bridge.shutdown()
-                break
-
-            elif action == "info":
-                bridge.get_kernel_info()
-
-            elif action == "is_alive":
-                bridge.send_message({
-                    "type": "is_alive",
-                    "alive": bridge.is_alive()
-                })
-
-            elif action == "complete":
-                code = cmd.get("code", "")
-                cursor_pos = cmd.get("cursor_pos", len(code))
-                bridge.complete(code, cursor_pos)
-
-            elif action == "inspect":
-                code = cmd.get("code", "")
-                cursor_pos = cmd.get("cursor_pos", len(code))
-                detail_level = cmd.get("detail_level", 0)
-                request_id = cmd.get("request_id")
-                bridge.inspect(code, cursor_pos, detail_level, request_id)
-
-            elif action == "input_reply":
-                request_id = cmd.get("request_id")
-                value = cmd.get("value", "")
-                if not isinstance(request_id, str) or not request_id:
-                    bridge.send_message({
-                        "type": "error",
-                        "error": "Missing required request_id for input_reply action"
-                    })
-                    continue
-                if not isinstance(value, str):
-                    value = str(value)
-                bridge.input_reply(request_id, value)
-
-            elif action == "ping":
-                bridge.send_message({"type": "pong"})
-
+    async def handle(self, cmd: Dict[str, Any]) -> bool:
+        """Run one command. Returns False when the bridge should exit."""
+        action = cmd.get("action", "")
+        if action == "start":
+            await self.start(cmd.get("kernel_name") or "python3")
+        elif action == "connect":
+            if cmd.get("connection_file"):
+                await self.connect(cmd["connection_file"])
             else:
-                bridge.send_message({
-                    "type": "error",
-                    "error": f"Unknown action: {action}"
-                })
+                self.error("Missing connection_file parameter")
+        elif action == "execute":
+            cell_id = cmd.get("cell_id")
+            if not isinstance(cell_id, str) or not cell_id:
+                self.error("Missing required cell_id for execute action")
+            else:
+                self.execute(cmd.get("code", ""), cell_id, cmd.get("stop_on_error", True) is not False)
+        elif action == "interrupt":
+            await self.interrupt()
+        elif action == "restart":
+            await self.restart()
+        elif action == "shutdown":
+            await self.shutdown()
+            return False
+        elif action == "info":
+            await self.kernel_info()
+        elif action == "is_alive":
+            await self.is_alive()
+        elif action == "complete":
+            code = cmd.get("code", "")
+            asyncio.ensure_future(self.complete(code, cmd.get("cursor_pos", len(code)), cmd.get("request_id")))
+        elif action == "inspect":
+            code = cmd.get("code", "")
+            asyncio.ensure_future(self.inspect(code, cmd.get("cursor_pos", len(code)),
+                                               cmd.get("detail_level", 0), cmd.get("request_id")))
+        elif action == "input_reply":
+            request_id = cmd.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                self.error("Missing required request_id for input_reply action")
+            else:
+                self.input_reply(request_id, str(cmd.get("value", "")))
+        elif action == "ping":
+            self.send({"type": "pong"})
+        else:
+            self.error(f"Unknown action: {action}")
+        return True
 
-    except KeyboardInterrupt:
-        pass
-    finally:
-        bridge.shutdown()
+
+def _read_stdin(loop: asyncio.AbstractEventLoop, lines: asyncio.Queue) -> None:
+    for line in sys.stdin:
+        loop.call_soon_threadsafe(lines.put_nowait, line)
+    loop.call_soon_threadsafe(lines.put_nowait, None)
+
+
+async def main() -> None:
+    loop = asyncio.get_running_loop()
+    bridge = KernelBridge(loop)
+    lines: asyncio.Queue = asyncio.Queue()
+    threading.Thread(target=_read_stdin, args=(loop, lines), daemon=True).start()
+    bridge.send({"type": "ready"})
+
+    running = True
+    while running:
+        line = await lines.get()
+        if line is None:  # Neovim closed our stdin
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            cmd = json.loads(line)
+        except json.JSONDecodeError as e:
+            bridge.error(f"Invalid JSON: {e}")
+            continue
+        try:
+            running = await bridge.handle(cmd)
+        except Exception as e:
+            bridge.error(f"{cmd.get('action', '?')} failed: {e}")
+
+    if bridge.kc or bridge.km:
+        await bridge.shutdown()
+
+
+def run() -> None:
+    # Keep the protocol stream UTF-8 regardless of the Windows console code page
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+        sys.stdin.reconfigure(encoding="utf-8")
+    if sys.platform == "win32":
+        # pyzmq's asyncio integration needs a selector loop on Windows
+        loop = asyncio.SelectorEventLoop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(main())
+        finally:
+            loop.close()
+    else:
+        asyncio.run(main())
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        run()
+    except KeyboardInterrupt:
+        pass

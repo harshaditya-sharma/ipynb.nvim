@@ -14,7 +14,13 @@ M.results = {
 function M.run_test(name, fn)
 	-- Reset state between tests
 	M.close_all_notebooks()
+	M.run_step(name, fn)
+end
 
+---Run a test step that shares state with the previous step (no cleanup first)
+---@param name string Test name
+---@param fn function Test function
+function M.run_step(name, fn)
 	local ok, err = pcall(fn)
 	if ok then
 		print("  PASS: " .. name)

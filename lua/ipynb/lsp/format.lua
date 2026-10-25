@@ -5,6 +5,8 @@
 local M = {}
 
 local util = require('ipynb.lsp.util')
+local io_mod = require('ipynb.io')
+local magics = require('ipynb.magics')
 
 ---Apply LSP text edits to a Lua table of lines (avoids buffer side effects)
 ---@param lines string[] Current lines (will be modified in place)
@@ -169,7 +171,10 @@ local function handle_range_format(ctx, method, params, handler, client, _req_bu
         -- (avoids apply_text_edits registering buffer with current window)
         if vim.api.nvim_buf_is_valid(edit_buf) and #translated > 0 then
           local lines = vim.api.nvim_buf_get_lines(edit_buf, 0, -1, false)
+          local original = lines
+          lines = require('ipynb.lsp.shadow').shadow_content(state, original, 'code') -- what the server saw
           M.apply_edits_to_lines(lines, translated)
+          lines = magics.restore(lines, original)
 
           -- Check if edit session is still active (user might have closed float during format)
           -- If not active, skip sync since facade is non-modifiable
@@ -238,9 +243,32 @@ local function handle_range_format(ctx, method, params, handler, client, _req_bu
         if orig_handler then orig_handler(nil, {}) end
         return
       end
-      vim.bo[state.facade_buf].modifiable = true
-      pcall(vim.lsp.util.apply_text_edits, result, state.facade_buf, 'utf-16')
-      vim.bo[state.facade_buf].modifiable = false
+      local content_start, content_end = cells_mod.get_content_range(state, start_cell_idx)
+      if content_start and content_end then
+        -- Apply to the cell's source lines (unescaped, magics restored), not raw facade text
+        local lines = io_mod.unescape_lines(
+          vim.api.nvim_buf_get_lines(state.facade_buf, content_start, content_end + 1, false)
+        )
+        local original = lines
+        lines = require('ipynb.lsp.shadow').shadow_content(state, original, 'code') -- what the server saw
+        local translated = {}
+        for _, edit in ipairs(result) do
+          local e = vim.deepcopy(edit)
+          e.range.start.line = e.range.start.line - content_start
+          e.range['end'].line = e.range['end'].line - content_start
+          if e.range.start.line >= 0 then
+            table.insert(translated, e)
+          end
+        end
+        M.apply_edits_to_lines(lines, translated)
+        lines = magics.restore(lines, original)
+        local in_edit_session = state.edit_state ~= nil
+        vim.bo[state.facade_buf].modifiable = true
+        pcall(vim.api.nvim_buf_set_lines, state.facade_buf, content_start, content_end + 1, false, io_mod.escape_lines(lines))
+        if not in_edit_session then
+          vim.bo[state.facade_buf].modifiable = false
+        end
+      end
 
       -- Sync changes
       cells_mod.sync_cells_from_facade(state)
@@ -355,8 +383,13 @@ function M.format_cell(state, cell_idx, callback)
 
       if #translated > 0 then
         -- Get current cell content and apply edits
-        local new_lines = vim.api.nvim_buf_get_lines(state.facade_buf, current_start, current_end + 1, false)
+        local new_lines = io_mod.unescape_lines(
+          vim.api.nvim_buf_get_lines(state.facade_buf, current_start, current_end + 1, false)
+        )
+        local original = new_lines
+        new_lines = shadow.shadow_content(state, original, 'code') -- what the server saw
         M.apply_edits_to_lines(new_lines, translated)
+        new_lines = magics.restore(new_lines, original)
 
         -- Trim trailing blank lines (formatters often add these, not useful in notebooks)
         local max_trailing = require('ipynb.config').get().format.trailing_blank_lines
@@ -389,7 +422,7 @@ function M.format_cell(state, cell_idx, callback)
         -- Keep modifiable if edit session is active (edit.lua:281 keeps it modifiable during editing)
         local in_edit_session = state.edit_state ~= nil
         vim.bo[state.facade_buf].modifiable = true
-        pcall(vim.api.nvim_buf_set_lines, state.facade_buf, current_start, current_end + 1, false, new_lines)
+        pcall(vim.api.nvim_buf_set_lines, state.facade_buf, current_start, current_end + 1, false, io_mod.escape_lines(new_lines))
         if not in_edit_session then
           vim.bo[state.facade_buf].modifiable = false
         end

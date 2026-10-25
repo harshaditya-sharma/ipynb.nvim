@@ -327,6 +327,20 @@ local function get_text_width(win)
   return width
 end
 
+---Format a run time the way notebook UIs do: 85ms, 1.2s, 2m 03s
+---@param seconds number
+---@return string
+function M.format_duration(seconds)
+  if seconds < 1 then
+    return string.format('%dms', math.floor(seconds * 1000 + 0.5))
+  elseif seconds < 60 then
+    return string.format('%.1fs', seconds)
+  elseif seconds < 3600 then
+    return string.format('%dm %02ds', math.floor(seconds / 60), math.floor(seconds % 60))
+  end
+  return string.format('%dh %02dm', math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+end
+
 ---Get display width of a string (handles multi-byte chars)
 ---@param str string
 ---@return number
@@ -342,8 +356,9 @@ end
 ---@param border_hl string Border highlight group
 ---@param language string|nil Language for code cells
 ---@param top_hint table|nil Optional type conversion hint {icon, key}
+---@param execution_time number|nil Seconds the last run took
 ---@return table[] Virtual text segments
-local function build_top_border(cell_type, execution_count, execution_state, width, border_hl, language, top_hint)
+local function build_top_border(cell_type, execution_count, execution_state, width, border_hl, language, top_hint, execution_time)
   local icon = cell_icons[cell_type]
   local label_text = cell_type
 
@@ -385,6 +400,9 @@ local function build_top_border(cell_type, execution_count, execution_state, wid
   -- Add execution count for code cells
   if cell_type == 'code' and execution_count and execution_count ~= vim.NIL then
     local count_str = string.format('[%d]', execution_count)
+    if execution_time and (execution_state == nil or execution_state == 'idle') then
+      count_str = string.format('[%d %s]', execution_count, M.format_duration(execution_time))
+    end
     right_str = right_str .. count_str .. borders.horizontal
     table.insert(right_parts, { text = count_str, hl = 'IpynbExecCount' })
     table.insert(right_parts, { text = borders.horizontal, hl = border_hl })
@@ -576,7 +594,7 @@ function M.render_cell(state, cell_idx, is_active, target_buf)
   -- Priority 150 = higher than treesitter (100) to override syntax highlighting
   local top_hint = hints and hints.top_hint or nil
   local top_border_segments = build_top_border(
-    cell.type, cell.execution_count, cell.execution_state, width, border_hl, language, top_hint
+    cell.type, cell.execution_count, cell.execution_state, width, border_hl, language, top_hint, cell.execution_time
   )
   vim.api.nvim_buf_set_extmark(buf, visual_ns, start_line, 0, {
     end_row = start_line,

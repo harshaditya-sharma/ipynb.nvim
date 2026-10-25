@@ -408,7 +408,9 @@ function M.open(state, mode)
   end
 
   -- Get lines from facade buffer (content only, no markers)
-  local lines = vim.api.nvim_buf_get_lines(state.facade_buf, content_start, content_end + 1, false)
+  local lines = require('ipynb.io').unescape_lines(
+    vim.api.nvim_buf_get_lines(state.facade_buf, content_start, content_end + 1, false)
+  )
 
   -- Get or create edit buffer for this cell
   local buf = get_or_create_edit_buf(cell, lines)
@@ -566,7 +568,7 @@ function M.setup_sync(state, buf)
     local line_count_changed = old_line_count ~= new_count
 
     -- Sync to facade (one undo entry per call)
-    set_facade_lines(state.facade_buf, edit.start_line, edit.end_line + 1, new_lines)
+    set_facade_lines(state.facade_buf, edit.start_line, edit.end_line + 1, require('ipynb.io').escape_lines(new_lines))
 
     -- Re-show diagnostics (nvim_buf_set_lines clears extmarks on modified lines)
     require('ipynb.lsp').refresh_facade_diagnostics(state)
@@ -623,7 +625,7 @@ function M.setup_sync(state, buf)
       if edit.insert_synced then
         pcall(vim.cmd.undojoin)
       end
-      set_facade_lines(state.facade_buf, edit.start_line, edit.end_line + 1, new_lines)
+      set_facade_lines(state.facade_buf, edit.start_line, edit.end_line + 1, require('ipynb.io').escape_lines(new_lines))
       edit.insert_synced = true
 
       -- Re-show diagnostics (nvim_buf_set_lines clears extmarks on modified lines)
@@ -1035,7 +1037,9 @@ local function global_undo_redo(state, cmd)
       if cell.id == target_cell_id then
         local content_start, content_end = cells_mod.get_content_range(state, i)
         if content_start and content_end then
-          local lines = vim.api.nvim_buf_get_lines(state.facade_buf, content_start, content_end + 1, false)
+          local lines = require('ipynb.io').unescape_lines(
+            vim.api.nvim_buf_get_lines(state.facade_buf, content_start, content_end + 1, false)
+          )
           vim.api.nvim_buf_set_lines(state.edit_state.buf, 0, -1, false, lines)
 
           cell.edit_buf = state.edit_state.buf

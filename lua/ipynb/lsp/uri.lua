@@ -63,6 +63,17 @@ function M.parse_facade_uri(uri)
   return nil
 end
 
+---Comparable form of a file path (forward slashes; case-insensitive on Windows)
+---@param path string
+---@return string
+function M.path_key(path)
+  local key = vim.fs.normalize(vim.fn.fnamemodify(path, ':p'))
+  if vim.fn.has('win32') == 1 then
+    key = key:lower()
+  end
+  return key
+end
+
 ---Check if a URI is a facade URI
 ---@param uri string
 ---@return boolean
@@ -103,8 +114,18 @@ function M.rewrite_result_uris(result, state, method)
     return result
   end
 
-  local shadow_uri = vim.uri_from_fname(state.shadow_path)
+  local shadow_key = M.path_key(state.shadow_path)
   local facade_abs = vim.fn.fnamemodify(state.facade_path, ':p')
+
+  -- Servers may percent-encode the drive colon or change drive-letter case
+  -- (file:///c%3A/...), so compare decoded, normalized paths, not raw URIs.
+  local function is_shadow(uri)
+    if type(uri) ~= 'string' or uri:sub(1, 7) ~= 'file://' then
+      return false
+    end
+    local ok, fname = pcall(vim.uri_to_fname, uri)
+    return ok and M.path_key(fname) == shadow_key
+  end
 
   -- Navigation methods (gd, gD, gi, gt) use file:// so bufadd finds existing facade buffer
   -- Other methods (gr references, etc.) use nb:// so pickers show facade content
@@ -124,10 +145,10 @@ function M.rewrite_result_uris(result, state, method)
     end
 
     -- Rewrite common URI fields
-    if obj.uri == shadow_uri then
+    if is_shadow(obj.uri) then
       obj.uri = facade_uri
     end
-    if obj.targetUri == shadow_uri then
+    if is_shadow(obj.targetUri) then
       obj.targetUri = facade_uri
     end
 

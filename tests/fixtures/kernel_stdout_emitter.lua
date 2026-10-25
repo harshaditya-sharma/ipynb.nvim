@@ -24,3 +24,6 @@ io.write(stream('before', 'before\n') .. '\n')
 io.write(large .. '\n')
 io.write(stream('after', 'after\n') .. '\n')
 io.flush()
+-- Stay alive briefly like the real bridge: on Windows Neovim stops reading a
+-- job's stdout once the process has exited, dropping whatever is still queued.
+vim.uv.sleep(500)

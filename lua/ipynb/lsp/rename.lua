@@ -4,6 +4,7 @@
 local M = {}
 
 local util = require('ipynb.lsp.util')
+local io_mod = require('ipynb.io')
 local uri_mod = require('ipynb.lsp.uri')
 
 ---Handle textDocument/rename interception
@@ -44,7 +45,7 @@ local function handle_rename(ctx, method, params, handler, client, req_bufnr)
 
     -- Apply workspace edit to facade buffer
     vim.schedule(function()
-      M.apply_workspace_edit(state, result, ctx.is_edit_buf)
+      M.apply_workspace_edit(state, result, ctx.is_edit_buf, client.offset_encoding)
       -- Don't call orig_handler - we already applied edits and notified user
     end)
   end
@@ -58,28 +59,48 @@ end
 ---@param state NotebookState
 ---@param workspace_edit table LSP WorkspaceEdit
 ---@param is_edit_buf boolean Whether the rename was triggered from edit buffer
-function M.apply_workspace_edit(state, workspace_edit, is_edit_buf)
+---@param offset_encoding string|nil Client position encoding for edits to other files
+function M.apply_workspace_edit(state, workspace_edit, is_edit_buf, offset_encoding)
   local cells_mod = require('ipynb.cells')
   local shadow = require('ipynb.lsp.shadow')
   local diagnostics = require('ipynb.lsp.diagnostics')
 
-  -- Extract all edits from workspace edit (we know they're for our notebook)
-  local edits = {}
+  -- Edits for the notebook (shadow URI) are applied to the facade here; edits
+  -- for other workspace files go through Neovim's normal workspace-edit path.
+  local shadow_key = uri_mod.path_key(state.shadow_path)
+  local function is_notebook(uri)
+    local ok, fname = pcall(vim.uri_to_fname, uri)
+    return ok and uri_mod.path_key(fname) == shadow_key
+  end
 
-  if workspace_edit.changes then
-    -- Map of URI -> TextEdit[]
-    for _, uri_edits in pairs(workspace_edit.changes) do
-      for _, edit in ipairs(uri_edits) do
-        table.insert(edits, edit)
-      end
-    end
-  elseif workspace_edit.documentChanges then
-    -- Array of TextDocumentEdit
+  local edits = {}
+  local other = { changes = {}, documentChanges = {} }
+  local has_other = false
+
+  if workspace_edit.documentChanges then
     for _, change in ipairs(workspace_edit.documentChanges) do
-      for _, edit in ipairs(change.edits or {}) do
-        table.insert(edits, edit)
+      if change.textDocument and is_notebook(change.textDocument.uri) then
+        vim.list_extend(edits, change.edits or {})
+      else
+        table.insert(other.documentChanges, change)
+        has_other = true
       end
     end
+    other.changes = nil
+  elseif workspace_edit.changes then
+    for uri, uri_edits in pairs(workspace_edit.changes) do
+      if is_notebook(uri) then
+        vim.list_extend(edits, uri_edits)
+      else
+        other.changes[uri] = uri_edits
+        has_other = true
+      end
+    end
+    other.documentChanges = nil
+  end
+
+  if has_other then
+    vim.lsp.util.apply_workspace_edit(other, offset_encoding or 'utf-16')
   end
 
   if #edits == 0 then
@@ -106,7 +127,7 @@ function M.apply_workspace_edit(state, workspace_edit, is_edit_buf)
     local end_char = edit.range['end'].character
 
     -- Get the affected lines
-    local lines = vim.api.nvim_buf_get_lines(state.facade_buf, start_line, end_line + 1, false)
+    local lines = io_mod.unescape_lines(vim.api.nvim_buf_get_lines(state.facade_buf, start_line, end_line + 1, false))
     if #lines > 0 then
       -- Apply the edit to the lines
       local prefix = lines[1]:sub(1, start_char)
@@ -126,7 +147,7 @@ function M.apply_workspace_edit(state, workspace_edit, is_edit_buf)
       end
 
       -- Replace just these lines
-      pcall(vim.api.nvim_buf_set_lines, state.facade_buf, start_line, end_line + 1, false, replacement)
+      pcall(vim.api.nvim_buf_set_lines, state.facade_buf, start_line, end_line + 1, false, io_mod.escape_lines(replacement))
     end
   end
   vim.bo[state.facade_buf].modifiable = false
@@ -143,7 +164,9 @@ function M.apply_workspace_edit(state, workspace_edit, is_edit_buf)
       local cell_idx = state.edit_state.cell_idx
       local content_start, content_end = cells_mod.get_content_range(state, cell_idx)
       if content_start and content_end then
-        local new_lines = vim.api.nvim_buf_get_lines(state.facade_buf, content_start, content_end + 1, false)
+        local new_lines = io_mod.unescape_lines(
+          vim.api.nvim_buf_get_lines(state.facade_buf, content_start, content_end + 1, false)
+        )
         vim.api.nvim_buf_set_lines(edit_buf, 0, -1, false, new_lines)
         state.edit_state.end_line = content_start + #new_lines - 1
       end
